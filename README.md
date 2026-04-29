@@ -2,7 +2,7 @@
 DrivoR: an end-to-end driving model by driving on registers.
 
 <p align="center">
-  <img src="/assets/architecture.jpg" alt="Pipeline">
+  <img src="./assets/architecture.jpg" alt="Pipeline">
 </p>
 
 

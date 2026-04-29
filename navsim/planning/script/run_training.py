@@ -4,6 +4,7 @@ from typing import Tuple
 from pathlib import Path
 import logging
 import pickle
+import json
 from datetime import datetime
 
 import hydra
@@ -24,6 +25,26 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
+
+
+def _maybe_apply_cache_overrides(cfg: DictConfig) -> None:
+    if not cfg.use_cache_without_dataset or cfg.cache_path is None:
+        return
+
+    manifest_path = Path(cfg.cache_path) / ".songdo_drivor_manifest.json"
+    if not manifest_path.is_file():
+        return
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if "image_size" in manifest:
+        cfg.agent.config.image_size = manifest["image_size"]
+        logger.info("Using Songdo DrivoR cached image_size override: %s", manifest["image_size"])
+    if "train_logs" in manifest:
+        cfg.train_logs = manifest["train_logs"]
+        logger.info("Using Songdo DrivoR cached train_logs override: %s", manifest["train_logs"])
+    if "val_logs" in manifest:
+        cfg.val_logs = manifest["val_logs"]
+        logger.info("Using Songdo DrivoR cached val_logs override: %s", manifest["val_logs"])
 
 def dist_ready():
     return dist.is_available() and dist.is_initialized()
@@ -98,6 +119,8 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Global Seed set to {cfg.seed}")
 
     logger.info(f"Path where all results are stored: {cfg.output_dir}")
+
+    _maybe_apply_cache_overrides(cfg)
 
     logger.info("Building Agent")
     agent: AbstractAgent = instantiate(cfg.agent)

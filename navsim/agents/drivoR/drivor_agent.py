@@ -80,6 +80,8 @@ class DrivoRAgent(AbstractAgent):
         self.scheduler_args = scheduler_args
         self.batch_size = batch_size
         self.num_gpus = num_gpus
+        self.use_metric_cache = bool(config.use_metric_cache)
+        self.loss = loss
 
 
         cache_data=False
@@ -90,45 +92,38 @@ class DrivoRAgent(AbstractAgent):
         if not cache_data and self._checkpoint_path == "": # only for training
             self.bce_logit_loss = nn.BCEWithLogitsLoss()
             self.b2d = config.b2d
+            self.ray = False
 
-            self.ray=True
-
-            if self.ray:
+            if self.use_metric_cache:
                 from navsim.planning.utils.multithreading.worker_ray_no_torch import RayDistributedNoTorch
                 from nuplan.planning.utils.multithreading.worker_utils import worker_map
+                from .score_module.compute_navsim_score import get_scores
+
+                self.ray = True
                 self.worker = RayDistributedNoTorch(threads_per_node=8)
-                self.worker_map=worker_map
+                self.worker_map = worker_map
 
+                metric_cache = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_cache"))
+                try:
+                    metric_cache_synthetic_0 = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_synthetic_reaction_pdm_v1.0-0"))
+                    metric_cache_synthetic_1 = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_synthetic_reaction_pdm_v1.0-1"))
+                    metric_cache_synthetic_2 = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_synthetic_reaction_pdm_v1.0-2"))
+                    metric_cache_synthetic_3 = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_synthetic_reaction_pdm_v1.0-3"))
+                    metric_cache_synthetic_4 = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_synthetic_reaction_pdm_v1.0-4"))
 
-            from .score_module.compute_navsim_score import get_scores
-
-            metric_cache = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_cache"))
-            try:
-                # add synthetic metric_cache
-                metric_cache_synthetic_0 = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_synthetic_reaction_pdm_v1.0-0"))
-                metric_cache_synthetic_1 = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_synthetic_reaction_pdm_v1.0-1"))
-                metric_cache_synthetic_2 = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_synthetic_reaction_pdm_v1.0-2"))
-                metric_cache_synthetic_3 = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_synthetic_reaction_pdm_v1.0-3"))
-                metric_cache_synthetic_4 = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_synthetic_reaction_pdm_v1.0-4"))
-
-                self.train_metric_cache_paths_synthetic = metric_cache_synthetic_0.metric_cache_paths
-                self.train_metric_cache_paths_synthetic.update(metric_cache_synthetic_0.metric_cache_paths)
-                self.train_metric_cache_paths_synthetic.update(metric_cache_synthetic_1.metric_cache_paths)
-                self.train_metric_cache_paths_synthetic.update(metric_cache_synthetic_2.metric_cache_paths)
-                self.train_metric_cache_paths_synthetic.update(metric_cache_synthetic_3.metric_cache_paths)
-                self.train_metric_cache_paths_synthetic.update(metric_cache_synthetic_4.metric_cache_paths)
+                    self.train_metric_cache_paths_synthetic = metric_cache_synthetic_0.metric_cache_paths
+                    self.train_metric_cache_paths_synthetic.update(metric_cache_synthetic_0.metric_cache_paths)
+                    self.train_metric_cache_paths_synthetic.update(metric_cache_synthetic_1.metric_cache_paths)
+                    self.train_metric_cache_paths_synthetic.update(metric_cache_synthetic_2.metric_cache_paths)
+                    self.train_metric_cache_paths_synthetic.update(metric_cache_synthetic_3.metric_cache_paths)
+                    self.train_metric_cache_paths_synthetic.update(metric_cache_synthetic_4.metric_cache_paths)
+                except Exception:
+                    self.train_metric_cache_paths_synthetic = None
 
                 self.test_metric_cache_paths_synthetic = self.train_metric_cache_paths_synthetic
-            except:
-                self.test_metric_cache_paths_synthetic = self.train_metric_cache_paths_synthetic = None
-
-            self.test_metric_cache_paths_synthetic = self.train_metric_cache_paths_synthetic
-            self.train_metric_cache_paths = metric_cache.metric_cache_paths
-            self.test_metric_cache_paths = metric_cache.metric_cache_paths
-
-            self.get_scores = get_scores
-
-            self.loss = loss
+                self.train_metric_cache_paths = metric_cache.metric_cache_paths
+                self.test_metric_cache_paths = metric_cache.metric_cache_paths
+                self.get_scores = get_scores
             
 
 
@@ -232,7 +227,8 @@ class DrivoRAgent(AbstractAgent):
             targets: Dict[str, torch.Tensor],
             pred: Dict[str, torch.Tensor],
     ) -> Dict:
-        return self.loss(targets, pred, self._config, self.compute_score)
+        scoring_function = self.compute_score if self.use_metric_cache else None
+        return self.loss(targets, pred, self._config, scoring_function)
 
     def get_optimizers(self):
 
@@ -278,12 +274,18 @@ class DrivoRAgent(AbstractAgent):
             return [optimizer]
 
     def get_training_callbacks(self):
-
-        checkpoint_cb_best = ModelCheckpoint(save_top_k=1,
-                                        monitor='val/score_epoch',
-                                        filename='best-{epoch}-{step}',
-                                        mode="max"
-                                        )
+        if self.use_metric_cache:
+            checkpoint_cb_best = ModelCheckpoint(save_top_k=1,
+                                            monitor='val/score',
+                                            filename='best-{epoch}-{step}',
+                                            mode="max"
+                                            )
+        else:
+            checkpoint_cb_best = ModelCheckpoint(save_top_k=1,
+                                            monitor='val/chosen_fde',
+                                            filename='best-{epoch}-{step}',
+                                            mode="min"
+                                            )
         
         checkpoint_cb = ModelCheckpoint(save_last=True)
 

@@ -3,6 +3,7 @@ _target_: navsim.agents.drivoR.drivor_agent.DrivoRAgent
 config:
 
   b2d: false # training for navsim
+  use_metric_cache: true
 
   shared_refiner: false
   ref_num: 4 # number of refining steps

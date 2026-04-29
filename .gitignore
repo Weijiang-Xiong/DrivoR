@@ -13,3 +13,7 @@ __pycache__/
 /carla/
 *egg*
 .DS_Store
+
+/cache
+/scratch
+/storage
