@@ -14,12 +14,16 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 import torch.distributed as dist
 import pytorch_lightning as pl
+import torch
+
 
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import SceneFilter
 from navsim.common.dataloader import SceneLoader
 from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
 from navsim.planning.training.agent_lightning_module import AgentLightningModule
+
+torch.set_float32_matmul_precision("high")
 
 logger = logging.getLogger(__name__)
 
