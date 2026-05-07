@@ -44,6 +44,7 @@ trainer:
     strategy: ddp #_find_unused_parameters_true
     precision: 16-mixed  # floating point precision
     num_nodes: 1  # Number of nodes used for training
+    devices: 1 # number of devices (GPUs) to train on (per node)
 
     num_sanity_val_steps: 0  # number of validation steps to run before training begins
     fast_dev_run: false  # runs 1 batch of train/val/test for sanity
