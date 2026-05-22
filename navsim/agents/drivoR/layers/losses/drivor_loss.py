@@ -133,6 +133,8 @@ class DrivoRLoss(torch.nn.Module):
                         agent_class_weight: float = 1.0,
                         agent_box_weight: float = 1.0,
                         bev_semantic_weight: float = 1.0,
+                        imitation_score_ade_weight: float = 1.0,
+                        imitation_score_fde_weight: float = 1.0,
                         **kwargs):
         super().__init__()
 
@@ -147,6 +149,8 @@ class DrivoRLoss(torch.nn.Module):
         self.agent_class_weight = agent_class_weight
         self.agent_box_weight = agent_box_weight
         self.bev_semantic_weight = bev_semantic_weight
+        self.imitation_score_ade_weight = imitation_score_ade_weight
+        self.imitation_score_fde_weight = imitation_score_fde_weight
 
 
     def score_loss(self, pred_logit, pred_logit2, agents_state, pred_area_logits, target_scores, gt_states, gt_valid,
@@ -239,6 +243,18 @@ class DrivoRLoss(torch.nn.Module):
 
         return inter_loss
 
+    def imitation_score_loss(self, scores, proposals, target_trajectory):
+        displacement = torch.linalg.norm(
+            proposals[..., :2] - target_trajectory[:, None, :, :2], dim=-1
+        )
+        ade = displacement.mean(-1)
+        fde = displacement[..., -1]
+        cost = self.imitation_score_ade_weight * ade + self.imitation_score_fde_weight * fde
+        best_idx = cost.detach().argmin(1)
+        loss = F.cross_entropy(scores, best_idx)
+        hit_rate = (scores.detach().argmax(1) == best_idx).float().mean()
+        return loss, hit_rate
+
     def forward(self,targets: Dict[str, torch.Tensor], pred: Dict[str, torch.Tensor], config  , scoring_function=None):
 
         proposals = pred["proposals"]
@@ -278,6 +294,8 @@ class DrivoRLoss(torch.nn.Module):
         inter_loss0 = inter_loss_list[0]
         # min_loss1 = min_loss_list[1]
         # inter_loss1 = inter_loss_list[1]
+
+        # use PDM score when metric cache is enabled, otherwise use imitation score loss
         if scoring_function is not None:
             final_scores, best_scores, target_scores, gt_states, gt_valid, gt_ego_areas = scoring_function(
                 targets, proposals, test=False)
@@ -295,8 +313,14 @@ class DrivoRLoss(torch.nn.Module):
             score = final_scores[np.arange(len(final_scores)), top_proposals].mean()
             best_score = best_scores.mean()
             [da_loss, ttc_loss, noc_loss, progress_loss, ddc_loss, comfort_loss] = sub_score_loss
+            imitation_score_loss = proposals.new_tensor(0.0)
+            imitation_score_hit_rate = proposals.new_tensor(0.0)
         else:
-            final_score_loss = pred_ce_loss = pred_l1_loss = pred_area_loss = 0
+            imitation_score_loss, imitation_score_hit_rate = self.imitation_score_loss(
+                pred["pdm_score"], proposals, target_trajectory
+            )
+            final_score_loss = imitation_score_loss
+            pred_ce_loss = pred_l1_loss = pred_area_loss = 0
             score = 0
             best_score = 0
             da_loss = ttc_loss = noc_loss = progress_loss = ddc_loss = comfort_loss = 0
@@ -341,6 +365,8 @@ class DrivoRLoss(torch.nn.Module):
             'pred_ce_loss': pred_ce_loss,
             'pred_l1_loss': pred_l1_loss,
             'pred_area_loss': pred_area_loss,
+            "imitation_score_loss": imitation_score_loss,
+            "imitation_score_hit_rate": imitation_score_hit_rate,
             "inter_loss0": inter_loss0,
             # "inter_loss1": inter_loss1,
             "inter_loss": inter_loss,

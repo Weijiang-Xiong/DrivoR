@@ -110,6 +110,8 @@ loss:
   agent_class_weight: 1.0
   agent_box_weight: 0.1
   bev_semantic_weight: 1.0
+  imitation_score_ade_weight: 1.0
+  imitation_score_fde_weight: 1.0
   div_weight: 0.0
 
 
