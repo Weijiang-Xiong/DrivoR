@@ -112,6 +112,7 @@ loss:
   bev_semantic_weight: 1.0
   imitation_score_ade_weight: 1.0
   imitation_score_fde_weight: 1.0
+  imitation_score_temperature: 1.0
   div_weight: 0.0
 
 

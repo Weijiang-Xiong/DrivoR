@@ -135,6 +135,7 @@ class DrivoRLoss(torch.nn.Module):
                         bev_semantic_weight: float = 1.0,
                         imitation_score_ade_weight: float = 1.0,
                         imitation_score_fde_weight: float = 1.0,
+                        imitation_score_temperature: float = 1.0,
                         **kwargs):
         super().__init__()
 
@@ -151,6 +152,7 @@ class DrivoRLoss(torch.nn.Module):
         self.bev_semantic_weight = bev_semantic_weight
         self.imitation_score_ade_weight = imitation_score_ade_weight
         self.imitation_score_fde_weight = imitation_score_fde_weight
+        self.imitation_score_temperature = imitation_score_temperature
 
 
     def score_loss(self, pred_logit, pred_logit2, agents_state, pred_area_logits, target_scores, gt_states, gt_valid,
@@ -244,14 +246,16 @@ class DrivoRLoss(torch.nn.Module):
         return inter_loss
 
     def imitation_score_loss(self, scores, proposals, target_trajectory):
+        # navsim trajectory have (x, y, heading), but for imitation score loss we only use (x, y)
         displacement = torch.linalg.norm(
             proposals[..., :2] - target_trajectory[:, None, :, :2], dim=-1
         )
         ade = displacement.mean(-1)
         fde = displacement[..., -1]
         cost = self.imitation_score_ade_weight * ade + self.imitation_score_fde_weight * fde
+        target_prob = F.softmax(-cost.detach() / self.imitation_score_temperature, dim=1)
+        loss = F.cross_entropy(scores, target_prob)
         best_idx = cost.detach().argmin(1)
-        loss = F.cross_entropy(scores, best_idx)
         hit_rate = (scores.detach().argmax(1) == best_idx).float().mean()
         return loss, hit_rate
 
@@ -260,6 +264,7 @@ class DrivoRLoss(torch.nn.Module):
         proposals = pred["proposals"]
         proposal_list = pred["proposal_list"]
         target_trajectory = targets["trajectory"]
+        pdm_score_std = pred["pdm_score"].detach().std(dim=1).mean()
 
         ########
         if "trajectory_long" in targets.keys():
@@ -367,6 +372,7 @@ class DrivoRLoss(torch.nn.Module):
             'pred_area_loss': pred_area_loss,
             "imitation_score_loss": imitation_score_loss,
             "imitation_score_hit_rate": imitation_score_hit_rate,
+            "imitation_score_std": pdm_score_std,
             "inter_loss0": inter_loss0,
             # "inter_loss1": inter_loss1,
             "inter_loss": inter_loss,
