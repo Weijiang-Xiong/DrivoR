@@ -255,9 +255,10 @@ class DrivoRLoss(torch.nn.Module):
         cost = self.imitation_score_ade_weight * ade + self.imitation_score_fde_weight * fde
         target_prob = F.softmax(-cost.detach() / self.imitation_score_temperature, dim=1)
         loss = F.cross_entropy(scores, target_prob)
+        target_entropy = -(target_prob * target_prob.clamp_min(1e-12).log()).sum(dim=1).mean()
         best_idx = cost.detach().argmin(1)
         hit_rate = (scores.detach().argmax(1) == best_idx).float().mean()
-        return loss, hit_rate
+        return loss, hit_rate, target_entropy
 
     def forward(self,targets: Dict[str, torch.Tensor], pred: Dict[str, torch.Tensor], config  , scoring_function=None):
 
@@ -320,8 +321,9 @@ class DrivoRLoss(torch.nn.Module):
             [da_loss, ttc_loss, noc_loss, progress_loss, ddc_loss, comfort_loss] = sub_score_loss
             imitation_score_loss = proposals.new_tensor(0.0)
             imitation_score_hit_rate = proposals.new_tensor(0.0)
+            imitation_score_target_entropy = proposals.new_tensor(0.0)
         else:
-            imitation_score_loss, imitation_score_hit_rate = self.imitation_score_loss(
+            imitation_score_loss, imitation_score_hit_rate, imitation_score_target_entropy = self.imitation_score_loss(
                 pred["pdm_score"], proposals, target_trajectory
             )
             final_score_loss = imitation_score_loss
@@ -372,6 +374,7 @@ class DrivoRLoss(torch.nn.Module):
             'pred_area_loss': pred_area_loss,
             "imitation_score_loss": imitation_score_loss,
             "imitation_score_hit_rate": imitation_score_hit_rate,
+            "imitation_score_target_entropy": imitation_score_target_entropy,
             "imitation_score_std": pdm_score_std,
             "inter_loss0": inter_loss0,
             # "inter_loss1": inter_loss1,

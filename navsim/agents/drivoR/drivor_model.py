@@ -2,6 +2,7 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .score_module.scorer import Scorer
 from .transformer_decoder import TransformerDecoder, TransformerDecoderScorer
 from .layers.image_encoder.dinov2_lora import ImgEncoder
@@ -187,14 +188,25 @@ class DrivoRModel(nn.Module):
         output["agent_states"]=agent_states
         output["agent_labels"]=agent_labels
 
-        pdm_score = (
-        self._config.noc * pred_logit['no_at_fault_collisions'].sigmoid().log() +
-        self._config.dac * pred_logit['drivable_area_compliance'].sigmoid().log() +
-        self._config.ddc * pred_logit['driving_direction_compliance'].sigmoid().log() +    
-        (self._config.ttc * pred_logit['time_to_collision_within_bound'].sigmoid() +
-        self._config.ep * pred_logit['ego_progress'].sigmoid()  
-        + self._config.comfort * pred_logit['comfort'].sigmoid()).log()
-        )
+        pdm_score = pred_logit["ego_progress"].new_zeros(pred_logit["ego_progress"].shape)
+        for weight, key in (
+            (self._config.noc, "no_at_fault_collisions"),
+            (self._config.dac, "drivable_area_compliance"),
+            (self._config.ddc, "driving_direction_compliance"),
+        ):
+            if weight:
+                pdm_score = pdm_score + weight * F.logsigmoid(pred_logit[key])
+
+        weighted_score_terms = []
+        for weight, key in (
+            (self._config.ttc, "time_to_collision_within_bound"),
+            (self._config.ep, "ego_progress"),
+            (self._config.comfort, "comfort"),
+        ):
+            if weight:
+                weight_log = pred_logit[key].new_tensor(float(weight)).log()
+                weighted_score_terms.append(weight_log + F.logsigmoid(pred_logit[key]))
+        pdm_score = pdm_score + torch.logsumexp(torch.stack(weighted_score_terms, dim=0), dim=0)
 
         token = torch.argmax(pdm_score, dim=1)
         trajectory = proposals[torch.arange(batch_size), token]
@@ -203,6 +215,5 @@ class DrivoRModel(nn.Module):
         output["pdm_score"] = pdm_score
 
         return output
-
 
 
