@@ -111,12 +111,30 @@ class AgentLightningModule(pl.LightningModule):
                 self.log(f"{logging_prefix}/comfort", comfort, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
                 return final_score
+            else:
+                proposals = predictions["proposals"]
+                target_trajectory = targets["trajectory"]
+                displacement = torch.linalg.norm(proposals[..., :2] - target_trajectory[:, None, :, :2], dim=-1)
+                ade = displacement.mean(-1)
+                fde = displacement[..., -1]
+                chosen_ade = torch.linalg.norm(predictions["trajectory"][:, :, :2] - targets["trajectory"][:, :, :2], dim=-1).mean()
+                chosen_fde = torch.linalg.norm(predictions["trajectory"][:, -1, :2] - targets["trajectory"][:, -1, :2], dim=-1).mean()
 
-            chosen_fde = torch.linalg.norm(
-                predictions["trajectory"][:, -1, :2] - targets["trajectory"][:, -1, :2], dim=-1
-            ).mean()
-            self.log(f"{logging_prefix}/chosen_fde", chosen_fde, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-            return chosen_fde
+                if "pdm_score" in predictions:
+                    imitation_cost = (
+                        self.agent.loss.imitation_score_ade_weight * ade
+                        + self.agent.loss.imitation_score_fde_weight * fde
+                    )
+                    best_imitation_index = torch.argmin(imitation_cost, dim=1)
+                    pred_score_index = torch.argmax(predictions["pdm_score"], dim=1)
+                    imitation_score_hit_rate = torch.mean(pred_score_index == best_imitation_index, dtype=torch.float32)
+                    self.log(f"{logging_prefix}/imitation_score_hit_rate", imitation_score_hit_rate, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+                
+                self.log(f"{logging_prefix}/oracle_ade", ade.amin(1).mean(), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+                self.log(f"{logging_prefix}/oracle_fde", fde.amin(1).mean(), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+                self.log(f"{logging_prefix}/chosen_ade", chosen_ade, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+                self.log(f"{logging_prefix}/chosen_fde", chosen_fde, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+                return chosen_fde
         else:
             return self._step(batch, "val")
 

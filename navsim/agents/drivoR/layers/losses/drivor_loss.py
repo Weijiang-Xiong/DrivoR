@@ -136,6 +136,7 @@ class DrivoRLoss(torch.nn.Module):
                         imitation_score_ade_weight: float = 1.0,
                         imitation_score_fde_weight: float = 1.0,
                         imitation_score_temperature: float = 1.0,
+                        use_soft_score_target: bool = True,
                         **kwargs):
         super().__init__()
 
@@ -153,6 +154,7 @@ class DrivoRLoss(torch.nn.Module):
         self.imitation_score_ade_weight = imitation_score_ade_weight
         self.imitation_score_fde_weight = imitation_score_fde_weight
         self.imitation_score_temperature = imitation_score_temperature
+        self.use_soft_score_target = use_soft_score_target
 
 
     def score_loss(self, pred_logit, pred_logit2, agents_state, pred_area_logits, target_scores, gt_states, gt_valid,
@@ -253,10 +255,14 @@ class DrivoRLoss(torch.nn.Module):
         ade = displacement.mean(-1)
         fde = displacement[..., -1]
         cost = self.imitation_score_ade_weight * ade + self.imitation_score_fde_weight * fde
-        target_prob = F.softmax(-cost.detach() / self.imitation_score_temperature, dim=1)
-        loss = F.cross_entropy(scores, target_prob)
-        target_entropy = -(target_prob * target_prob.clamp_min(1e-12).log()).sum(dim=1).mean()
         best_idx = cost.detach().argmin(1)
+        if self.use_soft_score_target:
+            target_prob = F.softmax(-cost.detach() / self.imitation_score_temperature, dim=1)
+            loss = F.cross_entropy(scores, target_prob)
+            target_entropy = -(target_prob * target_prob.clamp_min(1e-12).log()).sum(dim=1).mean()
+        else:
+            loss = F.cross_entropy(scores, best_idx)
+            target_entropy = scores.new_zeros(())
         hit_rate = (scores.detach().argmax(1) == best_idx).float().mean()
         return loss, hit_rate, target_entropy
 

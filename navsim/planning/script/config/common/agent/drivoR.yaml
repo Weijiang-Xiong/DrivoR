@@ -113,6 +113,7 @@ loss:
   imitation_score_ade_weight: 1.0
   imitation_score_fde_weight: 1.0
   imitation_score_temperature: 1.0
+  use_soft_score_target: true
   div_weight: 0.0
 
 

@@ -10,7 +10,7 @@ import pickle
 from .drivor_model import DrivoRModel
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.planning.training.dataset import load_feature_target_from_pickle
-from pytorch_lightning.callbacks import ModelCheckpoint, ProgressBar, LearningRateMonitor
+from pytorch_lightning.callbacks import DeviceStatsMonitor, ModelCheckpoint, ProgressBar, LearningRateMonitor
 from navsim.common.dataloader import MetricCacheLoader
 from navsim.common.dataclasses import SensorConfig
 from .drivor_features import DrivoRTargetBuilder
@@ -292,9 +292,10 @@ class DrivoRAgent(AbstractAgent):
         lr_monitor = LearningRateMonitor(logging_interval="step", 
                                             log_momentum=False,
                                             log_weight_decay=False)
+        device_stats_monitor = DeviceStatsMonitor(cpu_stats=True)
         
         if self.progress_bar:
-            return [checkpoint_cb_best, checkpoint_cb, lr_monitor]
+            return [checkpoint_cb_best, checkpoint_cb, lr_monitor, device_stats_monitor]
         else:
             progress_bar = LitProgressBar()
-            return [checkpoint_cb_best, checkpoint_cb, progress_bar, lr_monitor]
+            return [checkpoint_cb_best, checkpoint_cb, progress_bar, lr_monitor, device_stats_monitor]
