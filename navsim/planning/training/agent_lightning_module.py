@@ -120,13 +120,13 @@ class AgentLightningModule(pl.LightningModule):
                 chosen_ade = torch.linalg.norm(predictions["trajectory"][:, :, :2] - targets["trajectory"][:, :, :2], dim=-1).mean()
                 chosen_fde = torch.linalg.norm(predictions["trajectory"][:, -1, :2] - targets["trajectory"][:, -1, :2], dim=-1).mean()
 
-                if "pdm_score" in predictions:
+                if "pred_logit" in predictions:
                     imitation_cost = (
                         self.agent.loss.imitation_score_ade_weight * ade
                         + self.agent.loss.imitation_score_fde_weight * fde
                     )
                     best_imitation_index = torch.argmin(imitation_cost, dim=1)
-                    pred_score_index = torch.argmax(predictions["pdm_score"], dim=1)
+                    pred_score_index = torch.argmax(predictions["pred_logit"]["ego_progress"], dim=1)
                     imitation_score_hit_rate = torch.mean(pred_score_index == best_imitation_index, dtype=torch.float32)
                     self.log(f"{logging_prefix}/imitation_score_hit_rate", imitation_score_hit_rate, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
                 

@@ -17,3 +17,6 @@ __pycache__/
 /cache
 /scratch
 /storage
+.vscode
+.agents
+.codex

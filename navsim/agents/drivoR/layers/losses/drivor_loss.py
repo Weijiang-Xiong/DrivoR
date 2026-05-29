@@ -247,7 +247,7 @@ class DrivoRLoss(torch.nn.Module):
 
         return inter_loss
 
-    def imitation_score_loss(self, scores, proposals, target_trajectory):
+    def imitation_score_loss(self, score_logits, proposals, target_trajectory):
         # navsim trajectory have (x, y, heading), but for imitation score loss we only use (x, y)
         displacement = torch.linalg.norm(
             proposals[..., :2] - target_trajectory[:, None, :, :2], dim=-1
@@ -256,14 +256,21 @@ class DrivoRLoss(torch.nn.Module):
         fde = displacement[..., -1]
         cost = self.imitation_score_ade_weight * ade + self.imitation_score_fde_weight * fde
         best_idx = cost.detach().argmin(1)
+        # Mirror NAVSIM subscore losses: each proposal gets an independent BCE target.
         if self.use_soft_score_target:
-            target_prob = F.softmax(-cost.detach() / self.imitation_score_temperature, dim=1)
-            loss = F.cross_entropy(scores, target_prob)
-            target_entropy = -(target_prob * target_prob.clamp_min(1e-12).log()).sum(dim=1).mean()
+            relative_cost = cost.detach() - cost.detach().amin(1, keepdim=True)
+            target_score = torch.exp(-relative_cost / self.imitation_score_temperature)
         else:
-            loss = F.cross_entropy(scores, best_idx)
-            target_entropy = scores.new_zeros(())
-        hit_rate = (scores.detach().argmax(1) == best_idx).float().mean()
+            target_score = torch.zeros_like(score_logits)
+            target_score.scatter_(1, best_idx[:, None], 1.0)
+
+        target_score = target_score.to(dtype=score_logits.dtype)
+        loss = F.binary_cross_entropy_with_logits(score_logits, target_score)
+        target_entropy = -(
+            target_score * target_score.clamp_min(1e-12).log()
+            + (1 - target_score) * (1 - target_score).clamp_min(1e-12).log()
+        ).mean()
+        hit_rate = (score_logits.detach().argmax(1) == best_idx).float().mean()
         return loss, hit_rate, target_entropy
 
     def forward(self,targets: Dict[str, torch.Tensor], pred: Dict[str, torch.Tensor], config  , scoring_function=None):
@@ -271,7 +278,6 @@ class DrivoRLoss(torch.nn.Module):
         proposals = pred["proposals"]
         proposal_list = pred["proposal_list"]
         target_trajectory = targets["trajectory"]
-        pdm_score_std = pred["pdm_score"].detach().std(dim=1).mean()
 
         ########
         if "trajectory_long" in targets.keys():
@@ -330,7 +336,7 @@ class DrivoRLoss(torch.nn.Module):
             imitation_score_target_entropy = proposals.new_tensor(0.0)
         else:
             imitation_score_loss, imitation_score_hit_rate, imitation_score_target_entropy = self.imitation_score_loss(
-                pred["pdm_score"], proposals, target_trajectory
+                pred["pred_logit"]["ego_progress"], proposals, target_trajectory
             )
             final_score_loss = imitation_score_loss
             pred_ce_loss = pred_l1_loss = pred_area_loss = 0
@@ -381,7 +387,6 @@ class DrivoRLoss(torch.nn.Module):
             "imitation_score_loss": imitation_score_loss,
             "imitation_score_hit_rate": imitation_score_hit_rate,
             "imitation_score_target_entropy": imitation_score_target_entropy,
-            "imitation_score_std": pdm_score_std,
             "inter_loss0": inter_loss0,
             # "inter_loss1": inter_loss1,
             "inter_loss": inter_loss,
