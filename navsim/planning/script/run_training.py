@@ -43,6 +43,13 @@ def _maybe_apply_cache_overrides(cfg: DictConfig) -> None:
     if "image_size" in manifest:
         cfg.agent.config.image_size = manifest["image_size"]
         logger.info("Using Songdo DrivoR cached image_size override: %s", manifest["image_size"])
+    songdo_split_path = cfg.get("songdo_split_path")
+    if songdo_split_path:
+        split_payload = json.loads(Path(songdo_split_path).read_text(encoding="utf-8"))
+        cfg.train_logs = [Path(session_filename).stem for session_filename in split_payload["train"]]
+        cfg.val_logs = [Path(session_filename).stem for session_filename in split_payload["test"]]
+        logger.info("Using Songdo DrivoR split override from %s", songdo_split_path)
+        return
     if "train_logs" in manifest:
         cfg.train_logs = manifest["train_logs"]
         logger.info("Using Songdo DrivoR cached train_logs override: %s", manifest["train_logs"])
