@@ -165,6 +165,10 @@ def main(cfg: DictConfig) -> None:
         logger.info("Building SceneLoader")
         train_data, val_data = build_datasets(cfg, agent)
 
+    if getattr(agent, "scheduler_args", None) is not None:
+        agent.scheduler_args.dataset_size = len(train_data)
+        logger.info("Using training dataset size for scheduler: %d", len(train_data))
+
     logger.info("Building Datasets")
     train_dataloader = DataLoader(train_data, **cfg.dataloader.params, shuffle=True,drop_last=True)
     logger.info("Num training samples: %d", len(train_data))
