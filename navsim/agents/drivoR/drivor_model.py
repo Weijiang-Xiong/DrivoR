@@ -12,6 +12,42 @@ log = pylogger.get_pylogger(__name__)
 import logging
 # log.setLevel(logging.DEBUG)
 
+
+class _GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
+
+
+def grad_reverse(x, lambd=1.0):
+    return _GradReverse.apply(x, lambd)
+
+
+class DomainClassifier(nn.Module):
+    def __init__(self, d_in, hidden=512):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(d_in, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, feat, lambd: float):
+        if feat.dim() == 3:
+            feat = feat.mean(dim=1)
+        elif feat.dim() != 2:
+            raise ValueError(f"Expected domain features with dim 2 or 3, got {feat.shape}")
+        feat = grad_reverse(feat, lambd)
+        return self.classifier(feat).squeeze(-1)
+
+
 class DrivoRModel(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -101,6 +137,10 @@ class DrivoRModel(nn.Module):
 
         # scorer
         self.scorer = Scorer(config)
+        self.domain_alignment = bool(config.get("domain_alignment", False))
+        if self.domain_alignment:
+            hidden = int(config.get("domain_classifier_hidden", 512))
+            self.domain_classifier = DomainClassifier(config.tf_d_model, hidden=hidden)
 
         self.b2d=config.b2d
 
@@ -121,6 +161,7 @@ class DrivoRModel(nn.Module):
 
         batch_size = ego_status.shape[0]
 
+        output={}
 
 
         scene_features = []
@@ -139,6 +180,28 @@ class DrivoRModel(nn.Module):
 
             log.debug(f"Backbone image - {image_scene_tokens.shape}")
             scene_features.append(image_scene_tokens)
+
+            if self.domain_alignment and "rendered_camera_feature" in features and "domain_alignment_mask" in features:
+                domain_mask = features["domain_alignment_mask"].bool().flatten()
+                if torch.any(domain_mask):
+                    rendered_img = features["rendered_camera_feature"][domain_mask]
+                    domain_batch_size = rendered_img.shape[0]
+                    rendered_scene_tokens = self.scene_embeds.repeat(domain_batch_size, 1, 1, 1)
+                    rendered_image_scene_tokens = self.image_backbone(rendered_img, rendered_scene_tokens)
+                    real_image_scene_tokens = image_scene_tokens[domain_mask]
+                    domain_features = torch.cat([rendered_image_scene_tokens, real_image_scene_tokens], dim=0)
+                    domain_labels = torch.cat(
+                        [
+                            domain_features.new_zeros(domain_batch_size),
+                            domain_features.new_ones(domain_batch_size),
+                        ],
+                        dim=0,
+                    )
+                    output["domain_logits"] = self.domain_classifier(
+                        domain_features,
+                        lambd=float(self._config.get("domain_grl_lambda", 1.0)),
+                    )
+                    output["domain_labels"] = domain_labels
 
         # lidar features
         if self.num_lidar > 0:
@@ -168,7 +231,6 @@ class DrivoRModel(nn.Module):
         proposals=proposal_list[-1]
         
 
-        output={}
         output["proposals"] = proposals
         output["proposal_list"] = proposal_list
 
@@ -215,5 +277,4 @@ class DrivoRModel(nn.Module):
         output["pdm_score"] = pdm_score
 
         return output
-
 

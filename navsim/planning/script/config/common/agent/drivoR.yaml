@@ -29,6 +29,13 @@ config:
   tf_d_ffn: 1024 # hidden size of the heads
 
   ####################
+  # image domain alignment
+  domain_alignment: true
+  domain_alignment_weight: 0.001
+  domain_grl_lambda: 1.0
+  domain_classifier_hidden: 512
+
+  ####################
   # sensor config
   cam_f0: [3]
   cam_l0: [3]

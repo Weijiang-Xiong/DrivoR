@@ -19,6 +19,30 @@ import sys
 from omegaconf import OmegaConf
 import math
 
+
+def _slice_batch(data, mask: torch.Tensor):
+    if torch.is_tensor(data):
+        if data.ndim > 0 and data.shape[0] == mask.shape[0]:
+            return data[mask]
+        return data
+    if isinstance(data, dict):
+        return {key: _slice_batch(value, mask) for key, value in data.items()}
+    if isinstance(data, list):
+        if all(torch.is_tensor(value) or isinstance(value, (dict, list, tuple)) for value in data):
+            return [_slice_batch(value, mask) for value in data]
+        if len(data) == mask.shape[0]:
+            indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+            return [data[index] for index in indices]
+        return data
+    if isinstance(data, tuple):
+        if all(torch.is_tensor(value) or isinstance(value, (dict, list, tuple)) for value in data):
+            return tuple(_slice_batch(value, mask) for value in data)
+        if len(data) == mask.shape[0]:
+            indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+            return tuple(data[index] for index in indices)
+        return data
+    return data
+
 class LitProgressBar(ProgressBar):
 
     def __init__(self):
@@ -228,7 +252,40 @@ class DrivoRAgent(AbstractAgent):
             pred: Dict[str, torch.Tensor],
     ) -> Dict:
         scoring_function = self.compute_score if self.use_metric_cache else None
-        return self.loss(targets, pred, self._config, scoring_function)
+        domain_mask = features.get("domain_alignment_mask")
+        if domain_mask is None:
+            return self.loss(targets, pred, self._config, scoring_function)
+
+        domain_mask = domain_mask.bool().flatten()
+        trajectory_mask = ~domain_mask
+        total_loss = pred["trajectory"].new_tensor(0.0)
+        loss_dict = {}
+
+        if torch.any(trajectory_mask):
+            trajectory_targets = _slice_batch(targets, trajectory_mask)
+            trajectory_pred = _slice_batch(pred, trajectory_mask)
+            trajectory_loss = self.loss(trajectory_targets, trajectory_pred, self._config, scoring_function)
+            if isinstance(trajectory_loss, dict):
+                loss_dict.update(trajectory_loss)
+                total_loss = total_loss + trajectory_loss["loss"]
+            else:
+                loss_dict["trajectory_loss"] = trajectory_loss
+                total_loss = total_loss + trajectory_loss
+
+        if torch.any(domain_mask):
+            if "domain_logits" not in pred or "domain_labels" not in pred:
+                raise KeyError("Domain alignment batch is missing domain classifier outputs")
+            domain_loss = F.binary_cross_entropy_with_logits(pred["domain_logits"], pred["domain_labels"])
+            domain_weight = float(self._config.get("domain_alignment_weight", 1.0))
+            domain_pred = pred["domain_logits"].detach() >= 0
+            domain_acc = torch.mean((domain_pred == pred["domain_labels"].bool()).float())
+            total_loss = total_loss + domain_weight * domain_loss
+            loss_dict["domain_loss"] = domain_loss
+            loss_dict["domain_acc"] = domain_acc
+            loss_dict["domain_weighted_loss"] = domain_weight * domain_loss
+
+        loss_dict["loss"] = total_loss
+        return loss_dict
 
     def get_optimizers(self):
 
