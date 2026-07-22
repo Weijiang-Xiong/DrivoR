@@ -277,12 +277,18 @@ class DrivoRAgent(AbstractAgent):
                 raise KeyError("Domain alignment batch is missing domain classifier outputs")
             domain_loss = F.binary_cross_entropy_with_logits(pred["domain_logits"], pred["domain_labels"])
             domain_weight = float(self._config.get("domain_alignment_weight", 1.0))
+            feature_alignment_loss = F.mse_loss(
+                pred["rendered_image_scene_tokens"].detach(), pred["real_image_scene_tokens"]
+            )
+            feature_alignment_weight = float(self._config.get("feature_alignment_weight", 0.0))
             domain_pred = pred["domain_logits"].detach() >= 0
             domain_acc = torch.mean((domain_pred == pred["domain_labels"].bool()).float())
-            total_loss = total_loss + domain_weight * domain_loss
+            total_loss = total_loss + domain_weight * domain_loss + feature_alignment_weight * feature_alignment_loss
             loss_dict["domain_loss"] = domain_loss
             loss_dict["domain_acc"] = domain_acc
             loss_dict["domain_weighted_loss"] = domain_weight * domain_loss
+            loss_dict["feature_alignment_loss"] = feature_alignment_loss
+            loss_dict["feature_alignment_weighted_loss"] = feature_alignment_weight * feature_alignment_loss
 
         loss_dict["loss"] = total_loss
         return loss_dict

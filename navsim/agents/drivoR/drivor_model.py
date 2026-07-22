@@ -189,6 +189,8 @@ class DrivoRModel(nn.Module):
                     rendered_scene_tokens = self.scene_embeds.repeat(domain_batch_size, 1, 1, 1)
                     rendered_image_scene_tokens = self.image_backbone(rendered_img, rendered_scene_tokens)
                     real_image_scene_tokens = image_scene_tokens[domain_mask]
+                    output["rendered_image_scene_tokens"] = rendered_image_scene_tokens
+                    output["real_image_scene_tokens"] = real_image_scene_tokens
                     domain_features = torch.cat([rendered_image_scene_tokens, real_image_scene_tokens], dim=0)
                     domain_labels = torch.cat(
                         [
@@ -277,4 +279,3 @@ class DrivoRModel(nn.Module):
         output["pdm_score"] = pdm_score
 
         return output
-
