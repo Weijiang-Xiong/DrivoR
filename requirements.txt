@@ -39,6 +39,7 @@ tqdm  # Used widely
 ujson  # Used in serialiation_callback.py
 
 pytorch-lightning==2.4.0
+wandb
 # tensorboard==2.19.0
 # # protobuf==4.25.3
 

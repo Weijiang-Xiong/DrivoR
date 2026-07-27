@@ -14,6 +14,7 @@ from omegaconf import DictConfig
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 import torch.distributed as dist
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 import torch
 
 
@@ -418,12 +419,21 @@ def main(cfg: DictConfig) -> None:
 
     if cfg.train_ckpt_path is None:
         # Pattern to match all .ckpt files in the base_path recursively
-        search_pattern = "/".join(str(cfg.output_dir).split("/")[:-1]) + "/*/lightning_logs/version_*/checkpoints/" + '*.ckpt'
+        search_pattern = "/".join(str(cfg.output_dir).split("/")[:-1]) + "/*/**/checkpoints/" + '*.ckpt'
         print("/".join(str(cfg.output_dir).split("/")[:-1]))
         print("search_pattern ", search_pattern)
         cfg.train_ckpt_path = find_latest_checkpoint(search_pattern)
         print("cfg.train_ckpt_path ", cfg.train_ckpt_path)
-    trainer = pl.Trainer(**cfg.trainer.params, callbacks=agent.get_training_callbacks())
+    trainer = pl.Trainer(
+        **cfg.trainer.params,
+        callbacks=agent.get_training_callbacks(),
+        logger=WandbLogger(
+            project="drivor",
+            name=cfg.experiment_name,
+            id=cfg.experiment_name,
+            save_dir=cfg.output_dir,
+        ),
+    )
 
     if cfg.validation_run:
         logger.info("Starting Validation")
