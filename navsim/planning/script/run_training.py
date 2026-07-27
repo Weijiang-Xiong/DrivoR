@@ -1,6 +1,6 @@
 import os
 import random
-from typing import Optional, Tuple
+from typing import Tuple
 from pathlib import Path
 import logging
 import pickle
@@ -11,7 +11,7 @@ import hydra
 import numpy as np
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-from torch.utils.data import ConcatDataset, DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader
 import torch.distributed as dist
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
@@ -44,9 +44,7 @@ class DrivoRDomainDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int):
         features, targets = self.dataset[idx]
-        model_image = features.get("image", features.get("camera_feature"))
-        if model_image is None:
-            raise KeyError("DrivoR cache sample is missing both 'image' and 'camera_feature'")
+        model_image = features["image"] if "image" in features else features["camera_feature"]
 
         normalized_features = {
             "camera_feature": model_image,
@@ -76,26 +74,6 @@ def _cache_log_names(cache_path: str, manifest_name: str, manifest_key: str) -> 
     return sorted(log_name.name for log_name in Path(cache_path).iterdir() if log_name.is_dir())
 
 
-def _scale_dataset(dataset: torch.utils.data.Dataset, weight: float, seed: int) -> Optional[torch.utils.data.Dataset]:
-    if weight <= 0.0 or len(dataset) == 0:
-        return None
-
-    full_copies = int(weight)
-    fractional = weight - full_copies
-    parts: list[torch.utils.data.Dataset] = [dataset for _ in range(full_copies)]
-
-    if fractional > 0.0:
-        subset_len = max(1, int(round(len(dataset) * fractional)))
-        rng = random.Random(seed)
-        indices = list(range(len(dataset)))
-        rng.shuffle(indices)
-        parts.append(Subset(dataset, indices[:subset_len]))
-
-    if not parts:
-        return None
-    return parts[0] if len(parts) == 1 else ConcatDataset(parts)
-
-
 class FixedRatioBatchSampler(torch.utils.data.Sampler):
     """Yields fixed-composition batches from a Songdo/NAVSIM ConcatDataset."""
 
@@ -106,7 +84,6 @@ class FixedRatioBatchSampler(torch.utils.data.Sampler):
         songdo_batch_size: int,
         navsim_batch_size: int,
         seed: int,
-        batches_per_epoch: Optional[int] = None,
     ):
         if songdo_len <= 0:
             raise ValueError("Songdo dataset must be non-empty for fixed-ratio batching")
@@ -122,13 +99,9 @@ class FixedRatioBatchSampler(torch.utils.data.Sampler):
         self.batch_size = songdo_batch_size + navsim_batch_size
         self.seed = seed
         self.epoch = 0
-        self.batches_per_epoch = batches_per_epoch
-        if self.batches_per_epoch is None:
-            self.batches_per_epoch = songdo_len // songdo_batch_size
+        self.batches_per_epoch = songdo_len // songdo_batch_size
         if self.batches_per_epoch <= 0:
-            raise ValueError(
-                "Fixed-ratio batching would produce zero batches; reduce songdo_batch_size or set mixed_batches_per_epoch"
-            )
+            raise ValueError("Fixed-ratio batching would produce zero batches; reduce songdo_batch_size")
 
     def __len__(self) -> int:
         _, world_size = self._distributed_info()
@@ -190,7 +163,7 @@ class FixedRatioBatchSampler(torch.utils.data.Sampler):
 
 
 def _maybe_apply_cache_overrides(cfg: DictConfig) -> None:
-    if not cfg.use_cache_without_dataset or cfg.cache_path is None:
+    if not cfg.use_cache_without_dataset:
         return
 
     manifest_path = Path(cfg.cache_path) / ".songdo_drivor_manifest.json"
@@ -300,16 +273,11 @@ def main(cfg: DictConfig) -> None:
     )
 
     train_batch_sampler = None
-    scheduler_dataset_size = None
-
     if cfg.use_cache_without_dataset:
         logger.info("Using cached data without building SceneLoader")
         assert (
             not cfg.force_cache_computation
         ), "force_cache_computation must be False when using cached data without building SceneLoader"
-        assert (
-            cfg.cache_path is not None
-        ), "cache_path must be provided when using cached data without building SceneLoader"
         train_data = CacheOnlyDataset(
             cache_path=cfg.cache_path,
             feature_builders=agent.get_feature_builders(),
@@ -324,16 +292,15 @@ def main(cfg: DictConfig) -> None:
         )
         train_data = DrivoRDomainDataset(train_data, domain_alignment=False)
         val_data = DrivoRDomainDataset(val_data, domain_alignment=False)
+        scheduler_dataset_size = len(train_data)
 
         navsim_cache_path = cfg.get("navsim_cache_path")
         if navsim_cache_path:
-            navsim_train_logs = cfg.get("navsim_train_logs")
-            if navsim_train_logs is None:
-                navsim_train_logs = _cache_log_names(
-                    navsim_cache_path,
-                    ".navsim_drivor_alignment_manifest.json",
-                    "train_logs",
-                )
+            navsim_train_logs = _cache_log_names(
+                navsim_cache_path,
+                ".navsim_drivor_alignment_manifest.json",
+                "train_logs",
+            )
             navsim_data = CacheOnlyDataset(
                 cache_path=navsim_cache_path,
                 feature_builders=agent.get_feature_builders(),
@@ -342,64 +309,57 @@ def main(cfg: DictConfig) -> None:
             )
             navsim_data = DrivoRDomainDataset(navsim_data, domain_alignment=True)
             navsim_batch_size = cfg.get("navsim_batch_size")
-            if navsim_batch_size is not None:
-                total_batch_size = int(cfg.dataloader.params.batch_size)
-                navsim_batch_size = int(navsim_batch_size)
-                songdo_batch_size = cfg.get("songdo_batch_size")
-                if songdo_batch_size is None:
-                    songdo_batch_size = total_batch_size - navsim_batch_size
-                else:
-                    songdo_batch_size = int(songdo_batch_size)
-                    if songdo_batch_size + navsim_batch_size != total_batch_size:
-                        raise ValueError(
-                            "songdo_batch_size + navsim_batch_size must equal dataloader.params.batch_size"
-                        )
-                mixed_batches_per_epoch = cfg.get("mixed_batches_per_epoch")
-                if mixed_batches_per_epoch is not None:
-                    mixed_batches_per_epoch = int(mixed_batches_per_epoch)
-                songdo_data = train_data
-                train_data = ConcatDataset([train_data, navsim_data])
-                train_batch_sampler = FixedRatioBatchSampler(
-                    songdo_len=len(songdo_data),
-                    navsim_len=len(navsim_data),
-                    songdo_batch_size=songdo_batch_size,
-                    navsim_batch_size=navsim_batch_size,
-                    seed=int(cfg.seed),
-                    batches_per_epoch=mixed_batches_per_epoch,
-                )
-                scheduler_dataset_size = len(train_batch_sampler) * train_batch_sampler.batch_size
-                logger.info(
-                    "Using NAVSIM alignment cache %s with fixed batches: %d Songdo + %d NAVSIM",
-                    navsim_cache_path,
-                    songdo_batch_size,
-                    navsim_batch_size,
-                )
+            if navsim_batch_size is None:
+                raise ValueError("navsim_batch_size must be set when navsim_cache_path is provided")
+
+            total_batch_size = int(cfg.dataloader.params.batch_size)
+            navsim_batch_size = int(navsim_batch_size)
+            songdo_batch_size = cfg.get("songdo_batch_size")
+            if songdo_batch_size is None:
+                songdo_batch_size = total_batch_size - navsim_batch_size
             else:
-                navsim_weight = float(cfg.get("navsim_train_weight", 1.0))
-                navsim_data = _scale_dataset(navsim_data, navsim_weight, int(cfg.seed))
-                if navsim_data is not None:
-                    train_data = ConcatDataset([train_data, navsim_data])
-                    logger.info("Using NAVSIM alignment cache %s with train weight %.3f", navsim_cache_path, navsim_weight)
+                songdo_batch_size = int(songdo_batch_size)
+                if songdo_batch_size + navsim_batch_size != total_batch_size:
+                    raise ValueError(
+                        "songdo_batch_size + navsim_batch_size must equal dataloader.params.batch_size"
+                    )
+            songdo_data = train_data
+            train_data = ConcatDataset([train_data, navsim_data])
+            train_batch_sampler = FixedRatioBatchSampler(
+                songdo_len=len(songdo_data),
+                navsim_len=len(navsim_data),
+                songdo_batch_size=songdo_batch_size,
+                navsim_batch_size=navsim_batch_size,
+                seed=int(cfg.seed),
+            )
+            scheduler_dataset_size = len(train_batch_sampler) * train_batch_sampler.batch_size
+            logger.info(
+                "Using NAVSIM alignment cache %s with fixed batches: %d Songdo + %d NAVSIM",
+                navsim_cache_path,
+                songdo_batch_size,
+                navsim_batch_size,
+            )
     else:
         logger.info("Building SceneLoader")
         train_data, val_data = build_datasets(cfg, agent)
+        scheduler_dataset_size = len(train_data)
 
     if getattr(agent, "scheduler_args", None) is not None:
-        if scheduler_dataset_size is None:
-            scheduler_dataset_size = len(train_data)
         agent.scheduler_args.dataset_size = scheduler_dataset_size
         logger.info("Using training dataset size for scheduler: %d", scheduler_dataset_size)
 
     logger.info("Building Datasets")
+    trainer_params = dict(cfg.trainer.params)
     if train_batch_sampler is None:
         train_dataloader = DataLoader(train_data, **cfg.dataloader.params, shuffle=True,drop_last=True)
     else:
         train_dataloader_params = dict(cfg.dataloader.params)
-        train_dataloader_params.pop("batch_size", None)
+        train_dataloader_params.pop("batch_size")
         train_dataloader = DataLoader(train_data, **train_dataloader_params, batch_sampler=train_batch_sampler)
-    logger.info("Num training samples: %d", len(train_data))
-    if train_batch_sampler is not None:
         logger.info("Num fixed-ratio training batches: %d", len(train_batch_sampler))
+        # FixedRatioBatchSampler already partitions batches across distributed ranks.
+        trainer_params["use_distributed_sampler"] = False
+    logger.info("Num training samples: %d", len(train_data))
     val_dataloader = DataLoader(val_data, **cfg.dataloader.params, shuffle=False,drop_last=True)
     logger.info("Num validation samples: %d", len(val_data))
 
@@ -425,7 +385,7 @@ def main(cfg: DictConfig) -> None:
         cfg.train_ckpt_path = find_latest_checkpoint(search_pattern)
         print("cfg.train_ckpt_path ", cfg.train_ckpt_path)
     trainer = pl.Trainer(
-        **cfg.trainer.params,
+        **trainer_params,
         callbacks=agent.get_training_callbacks(),
         logger=WandbLogger(
             project="drivor",
