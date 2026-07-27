@@ -390,7 +390,6 @@ def main(cfg: DictConfig) -> None:
         logger=WandbLogger(
             project="drivor",
             name=cfg.experiment_name,
-            id=cfg.experiment_name,
             save_dir=cfg.output_dir,
         ),
     )
