@@ -33,7 +33,7 @@ navsim_batch_size: null
 dataloader:
   params:
     batch_size: 32 #number of samples per batch
-    num_workers: 8  # number of workers for data loading
+    num_workers: 4  # number of workers for data loading
     pin_memory: true  # pin memory for faster GPU transfer
     prefetch_factor: 2  # number of samples loaded in advance by each worker
 
