@@ -288,7 +288,7 @@ class DrivoRLoss(torch.nn.Module):
 
         #############################
         ### TRAJECTORY AND DIVERSITY
-        trajectory_loss = 0
+        trajectory_loss = proposals.new_zeros(())
         min_loss_list = []
         inter_loss_list = []
         for proposals_i in proposal_list:
@@ -302,9 +302,16 @@ class DrivoRLoss(torch.nn.Module):
                     1).mean()
             #########
 
-            inter_loss = self.diversity_loss(proposals_i)
+            inter_loss = proposals_i.new_zeros(())
+            if self.inter_weight != 0:
+                inter_loss = self.diversity_loss(proposals_i)
 
-            trajectory_loss = self.prev_weight * trajectory_loss  + min_loss + inter_loss * self.inter_weight
+            stage_loss = min_loss
+            if self.inter_weight != 0:
+                stage_loss = stage_loss + inter_loss * self.inter_weight
+            if self.prev_weight != 0:
+                stage_loss = stage_loss + self.prev_weight * trajectory_loss
+            trajectory_loss = stage_loss
 
             min_loss_list.append(min_loss)
             inter_loss_list.append(inter_loss)
