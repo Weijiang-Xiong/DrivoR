@@ -32,6 +32,17 @@ CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
 
 
+def _load_finetune_checkpoint(lightning_module: AgentLightningModule, checkpoint_path: str) -> None:
+    """Warm-start a training module without restoring optimizer or trainer state."""
+    checkpoint_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)["state_dict"]
+    incompatible = lightning_module.load_state_dict(checkpoint_state, strict=False)
+    logger.info("Loaded fine-tuning checkpoint %s", checkpoint_path)
+    if incompatible.missing_keys:
+        logger.info("Freshly initialized tensors: %s", ", ".join(incompatible.missing_keys))
+    if incompatible.unexpected_keys:
+        logger.warning("Unexpected checkpoint tensors: %s", ", ".join(incompatible.unexpected_keys))
+
+
 class DrivoRDomainDataset(torch.utils.data.Dataset):
     """Normalizes cache samples so Songdo rendered-only and NAVSIM real/rendered caches collate together."""
 
@@ -272,6 +283,12 @@ def main(cfg: DictConfig) -> None:
         agent=agent,
     )
 
+    finetune_ckpt_path = cfg.get("finetune_ckpt_path")
+    if finetune_ckpt_path and cfg.train_ckpt_path:
+        raise ValueError("finetune_ckpt_path and train_ckpt_path are mutually exclusive")
+    if finetune_ckpt_path:
+        _load_finetune_checkpoint(lightning_module, finetune_ckpt_path)
+
     train_batch_sampler = None
     if cfg.use_cache_without_dataset:
         logger.info("Using cached data without building SceneLoader")
@@ -377,7 +394,7 @@ def main(cfg: DictConfig) -> None:
         return latest_file
 
 
-    if cfg.train_ckpt_path is None:
+    if cfg.train_ckpt_path is None and not finetune_ckpt_path:
         # Pattern to match all .ckpt files in the base_path recursively
         search_pattern = "/".join(str(cfg.output_dir).split("/")[:-1]) + "/*/**/checkpoints/" + '*.ckpt'
         print("/".join(str(cfg.output_dir).split("/")[:-1]))

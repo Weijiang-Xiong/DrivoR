@@ -62,12 +62,13 @@ trainer:
     default_root_dir: ${output_dir}
 
 train_ckpt_path: null
+finetune_ckpt_path: null
 
 agent:
   config:
     use_metric_cache: false
     scorer: rfs  # choices: rfs, imitation, or pdm (requires a compatible metric cache)
-    full_history_status: true
+    full_history_status: false
     noc: 0
     dac: 0
     ddc: 0
