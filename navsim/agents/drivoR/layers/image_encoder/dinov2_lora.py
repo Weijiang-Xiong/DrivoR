@@ -107,6 +107,12 @@ class _LoRA_qkv_timm(nn.Module):
         layer_norm_q: nn.Module = None,
         layer_norm_v: nn.Module = None,
         layer_norm_k: nn.Module = None,
+        target_lora_A_q: nn.Module = None,
+        target_lora_B_q: nn.Module = None,
+        target_lora_A_v: nn.Module = None,
+        target_lora_B_v: nn.Module = None,
+        target_scaling: float = 1.0,
+        target_enabled: bool = False,
     ):
         super().__init__()
         self.qkv = qkv
@@ -122,11 +128,20 @@ class _LoRA_qkv_timm(nn.Module):
         self.layernorm_q = layer_norm_q
         self.layernorm_v = layer_norm_v
         self.layernorm_k = layer_norm_k
+        self.lora_A_target_q = target_lora_A_q
+        self.lora_B_target_q = target_lora_B_q
+        self.lora_A_target_v = target_lora_A_v
+        self.lora_B_target_v = target_lora_B_v
+        self.target_scaling = target_scaling
+        self.target_enabled = target_enabled
 
     def forward(self, x):
         qkv = self.qkv(x)  # B,N,3*org_C
         new_q = self.linear_b_q(self.linear_a_q(self.layernorm_q(x)))
         new_v = self.linear_b_v(self.linear_a_v(self.layernorm_v(x)))
+        if self.target_enabled:
+            new_q = new_q + self.target_scaling * self.lora_B_target_q(self.lora_A_target_q(x))
+            new_v = new_v + self.target_scaling * self.lora_B_target_v(self.lora_A_target_v(x))
         #new_k = self.linear_b_k(self.linear_a_k(self.layernorm_k(x)))
         qkv[:, :, : self.dim] += new_q
         qkv[:, :, -self.dim :] += new_v
@@ -135,8 +150,23 @@ class _LoRA_qkv_timm(nn.Module):
 
 
 class LoRA_ViT_timm(nn.Module):
-    def __init__(self, vit_model: timm_ViT, r: int, lora_layer=None, use_layer_norm=False, use_qkv=False):
+    def __init__(
+        self,
+        vit_model: timm_ViT,
+        r: int,
+        lora_layer=None,
+        use_layer_norm=False,
+        use_qkv=False,
+        target_r: int = 0,
+        target_alpha: float = 16.0,
+        target_enabled: bool = False,
+    ):
         super(LoRA_ViT_timm, self).__init__()
+
+        self.w_As = []
+        self.w_Bs = []
+        self.target_w_As = []
+        self.target_w_Bs = []
 
         if r == 0:
             for param in vit_model.parameters():
@@ -151,9 +181,6 @@ class LoRA_ViT_timm(nn.Module):
 
             # dim = vit_model.head.in_features
             # create for storage, then we can init them or load weights
-            self.w_As = []  # These are linear layers
-            self.w_Bs = []
-
             # lets freeze first
             for param in vit_model.parameters():
                 param.requires_grad = False
@@ -182,6 +209,15 @@ class LoRA_ViT_timm(nn.Module):
                     layer_norm_v = nn.LayerNorm(self.dim)
                     if use_qkv:
                         layer_norm_k = nn.LayerNorm(self.dim)
+                target_lora_A_q = target_lora_B_q = None
+                target_lora_A_v = target_lora_B_v = None
+                if target_r > 0:
+                    target_lora_A_q = nn.Linear(self.dim, target_r, bias=False)
+                    target_lora_B_q = nn.Linear(target_r, self.dim, bias=False)
+                    target_lora_A_v = nn.Linear(self.dim, target_r, bias=False)
+                    target_lora_B_v = nn.Linear(target_r, self.dim, bias=False)
+                    self.target_w_As.extend((target_lora_A_q, target_lora_A_v))
+                    self.target_w_Bs.extend((target_lora_B_q, target_lora_B_v))
                 self.w_As.append(w_a_linear_q)
                 self.w_Bs.append(w_b_linear_q)
                 self.w_As.append(w_a_linear_v)
@@ -197,6 +233,12 @@ class LoRA_ViT_timm(nn.Module):
                     layer_norm_q,
                     layer_norm_v,
                     layer_norm_k,
+                    target_lora_A_q,
+                    target_lora_B_q,
+                    target_lora_A_v,
+                    target_lora_B_v,
+                    target_alpha / target_r if target_r > 0 else 1.0,
+                    target_enabled,
                 )
             self.reset_parameters()
             self.lora_vit = vit_model
@@ -245,6 +287,19 @@ class LoRA_ViT_timm(nn.Module):
             nn.init.kaiming_uniform_(w_A.weight, a=math.sqrt(5))
         for w_B in self.w_Bs:
             nn.init.zeros_(w_B.weight)
+        for w_A in self.target_w_As:
+            nn.init.kaiming_uniform_(w_A.weight, a=math.sqrt(5))
+        for w_B in self.target_w_Bs:
+            nn.init.zeros_(w_B.weight)
+
+    def set_target_lora_trainable(self, trainable: bool) -> None:
+        for layer in self.target_w_As + self.target_w_Bs:
+            layer.weight.requires_grad_(trainable)
+
+    def set_target_lora_enabled(self, enabled: bool) -> None:
+        for block in self.lora_vit.blocks:
+            if isinstance(block.attn.qkv, _LoRA_qkv_timm):
+                block.attn.qkv.target_enabled = enabled and block.attn.qkv.lora_A_target_q is not None
 
     def forward(self, x: Tensor, scene_tokens: torch.Tensor = None) -> Tensor:
         return self.lora_vit.forward_features(x, scene_tokens)
@@ -315,7 +370,13 @@ class ImgEncoder(torch.nn.Module):
 
         # Adaptation Setting
         if self.use_lora:
-            self.model = LoRA_ViT_timm(self.model, r=config.lora_rank)
+            self.model = LoRA_ViT_timm(
+                self.model,
+                r=config.lora_rank,
+                target_r=int(config.get("target_lora_rank", 0)),
+                target_alpha=float(config.get("target_lora_alpha", 16.0)),
+                target_enabled=bool(config.get("target_lora_enabled", False)),
+            )
         # Finetuning
         elif self.finetune:
             for param in self.model.parameters():
@@ -352,6 +413,17 @@ class ImgEncoder(torch.nn.Module):
         self.compress_fc = config.compress_fc
         if self.compress_fc:
             self.compress_fc_layer = torch.nn.Linear(3957, self.num_prefix_tokens)
+
+
+    def set_lora_trainable(self, trainable: bool) -> None:
+        if not self.use_lora:
+            raise ValueError("Backbone LoRA finetuning requires image_backbone.use_lora=true.")
+        self.model.set_target_lora_trainable(trainable)
+
+    def set_target_lora_enabled(self, enabled: bool) -> None:
+        if not self.use_lora:
+            raise ValueError("Backbone LoRA switching requires image_backbone.use_lora=true.")
+        self.model.set_target_lora_enabled(enabled)
 
 
     

@@ -26,7 +26,7 @@ sensor_blobs_path: ""
 
 # for domain alignment
 songdo_split_path: null
-navsim_cache_path: null
+navsim_cache_path: null  # required: paired NAVSIM real/rendered DrivoR cache
 songdo_batch_size: null
 navsim_batch_size: null
 
@@ -69,6 +69,18 @@ agent:
     use_metric_cache: false
     scorer: rfs  # choices: rfs, imitation, or pdm (requires a compatible metric cache)
     full_history_status: false
+    lora_finetune: true
+    proposal_lora_enabled: true
+    proposal_lora_rank: 64
+    proposal_lora_alpha: 128.0
+    proposal_lora_dropout: 0.0
+    scorer_lora_enabled: true
+    scorer_lora_rank: 64
+    scorer_lora_alpha: 128.0
+    scorer_lora_dropout: 0.0
+    backbone_lora_trainable: true
+    detach_scorer_inputs: true
+    domain_alignment: true
     noc: 0
     dac: 0
     ddc: 0

@@ -16,6 +16,19 @@ config:
   one_token_per_traj: true
   full_history_status: false
 
+  # Frozen-source target-domain adaptation
+  lora_finetune: false
+  proposal_lora_enabled: false
+  proposal_lora_rank: 0
+  proposal_lora_alpha: 16.0
+  proposal_lora_dropout: 0.0
+  scorer_lora_enabled: false
+  scorer_lora_rank: 0
+  scorer_lora_alpha: 16.0
+  scorer_lora_dropout: 0.0
+  backbone_lora_trainable: false
+  detach_scorer_inputs: true
+
   long_trajectory_additional_poses: -1 # to load additional poses (not use currently in this version)
 
   noc: 1.0 

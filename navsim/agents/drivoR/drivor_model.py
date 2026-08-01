@@ -8,6 +8,12 @@ from .score_module.scorer import Scorer
 from .transformer_decoder import TransformerDecoder, TransformerDecoderScorer
 from .layers.image_encoder.dinov2_lora import ImgEncoder
 from .layers.utils.mlp import MLP
+from .lora import (
+    inject_lora_into_mlp,
+    lora_activation,
+    set_lora_enabled,
+    set_lora_trainable,
+)
 from navsim.agents.drivoR.utils import pylogger
 log = pylogger.get_pylogger(__name__)
 import logging
@@ -97,6 +103,9 @@ class DrivoRModel(nn.Module):
             config_image_backbone["image_size"] = config["image_size"]
             config_image_backbone["num_scene_tokens"] = config["num_scene_tokens"]
             config_image_backbone["tf_d_model"] = config["tf_d_model"]
+            config_image_backbone["target_lora_rank"] = int(config.get("proposal_lora_rank", 0))
+            config_image_backbone["target_lora_alpha"] = float(config.get("proposal_lora_alpha", 16.0))
+            config_image_backbone["target_lora_enabled"] = bool(config.get("proposal_lora_enabled", False))
             self.image_backbone = ImgEncoder(config_image_backbone)
             self.scene_embeds = nn.Parameter(torch.randn(1, self.num_cams, self._config.num_scene_tokens, self.image_backbone.num_features)*1e-6, requires_grad=True)
 
@@ -108,6 +117,9 @@ class DrivoRModel(nn.Module):
             config_lidar_backbone["image_size"] = config["lidar_image_size"]
             config_lidar_backbone["num_scene_tokens"] = config["num_scene_tokens"]
             config_lidar_backbone["tf_d_model"] = config["tf_d_model"]
+            config_lidar_backbone["target_lora_rank"] = int(config.get("proposal_lora_rank", 0))
+            config_lidar_backbone["target_lora_alpha"] = float(config.get("proposal_lora_alpha", 16.0))
+            config_lidar_backbone["target_lora_enabled"] = bool(config.get("proposal_lora_enabled", False))
             self.lidar_backbone = ImgEncoder(config_lidar_backbone)
             self.lidar_scene_embeds = nn.Parameter(torch.randn(1, self.num_lidar, self._config.num_scene_tokens, self.image_backbone.num_features)*1e-6, requires_grad=True)
 
@@ -136,6 +148,15 @@ class DrivoRModel(nn.Module):
                 nn.ReLU(),
                 nn.Linear(config.tf_d_ffn, config.tf_d_model),
             )
+        scorer_lora_rank = int(config.get("scorer_lora_rank", 0))
+        if scorer_lora_rank > 0:
+            inject_lora_into_mlp(
+                self.pos_embed,
+                rank=scorer_lora_rank,
+                alpha=float(config.get("scorer_lora_alpha", 16.0)),
+                dropout=float(config.get("scorer_lora_dropout", 0.0)),
+                enabled=bool(config.get("scorer_lora_enabled", False)),
+            )
 
 
         # get the trajectory decoders
@@ -143,6 +164,16 @@ class DrivoRModel(nn.Module):
         self.state_size=3
         ref_num=config.ref_num
         self.traj_head = nn.ModuleList([MLP(config.tf_d_model, config.tf_d_ffn,  traj_head_output_size) for _ in range(ref_num+1)])
+        proposal_lora_rank = int(config.get("proposal_lora_rank", 0))
+        if proposal_lora_rank > 0:
+            # Earlier heads are auxiliary only; the deployed proposals use the final head.
+            inject_lora_into_mlp(
+                self.traj_head[-1].mlp,
+                rank=proposal_lora_rank,
+                alpha=float(config.get("proposal_lora_alpha", 16.0)),
+                dropout=float(config.get("proposal_lora_dropout", 0.0)),
+                enabled=bool(config.get("proposal_lora_enabled", False)),
+            )
 
         # scorer
         self.scorer = Scorer(config)
@@ -154,6 +185,63 @@ class DrivoRModel(nn.Module):
             self.domain_alignment_progress = 0.0
 
         self.b2d=config.b2d
+
+
+    def set_lora_enabled(self, proposal: bool, scorer: bool) -> None:
+        """Select source or target adapters independently at inference time."""
+        if proposal and int(self._config.get("proposal_lora_rank", 0)) <= 0:
+            raise ValueError("proposal_lora_enabled requires proposal_lora_rank > 0.")
+        if scorer and int(self._config.get("scorer_lora_rank", 0)) <= 0:
+            raise ValueError("scorer_lora_enabled requires scorer_lora_rank > 0.")
+
+        self._config.proposal_lora_enabled = proposal
+        self._config.scorer_lora_enabled = scorer
+        for backbone_name in ("image_backbone", "lidar_backbone"):
+            if hasattr(self, backbone_name):
+                getattr(self, backbone_name).set_target_lora_enabled(proposal)
+        set_lora_enabled(self.trajectory_decoder, proposal)
+        set_lora_enabled(self.traj_head[-1], proposal)
+        set_lora_enabled(self.pos_embed, scorer)
+        set_lora_enabled(self.scorer_attention, scorer)
+        set_lora_enabled(self.scorer.pred_score["ego_progress"], scorer)
+
+    def configure_lora_finetuning(self) -> None:
+        """Freeze source weights and expose only target adapters and alignment modules."""
+        self.requires_grad_(False)
+        self.set_lora_enabled(
+            bool(self._config.get("proposal_lora_enabled", False)),
+            bool(self._config.get("scorer_lora_enabled", False)),
+        )
+        set_lora_trainable(
+            self.trajectory_decoder,
+            bool(self._config.get("proposal_lora_enabled", False)),
+        )
+        set_lora_trainable(
+            self.traj_head[-1],
+            bool(self._config.get("proposal_lora_enabled", False)),
+        )
+        set_lora_trainable(
+            self.pos_embed,
+            bool(self._config.get("scorer_lora_enabled", False)),
+        )
+        set_lora_trainable(
+            self.scorer_attention,
+            bool(self._config.get("scorer_lora_enabled", False)),
+        )
+        set_lora_trainable(
+            self.scorer.pred_score["ego_progress"],
+            bool(self._config.get("scorer_lora_enabled", False)),
+        )
+
+        if bool(self._config.get("backbone_lora_trainable", False)):
+            for backbone_name in ("image_backbone", "lidar_backbone"):
+                if hasattr(self, backbone_name):
+                    getattr(self, backbone_name).set_lora_trainable(True)
+
+        if self.domain_alignment:
+            self.domain_classifier.requires_grad_(
+                bool(self._config.get("proposal_lora_enabled", False))
+            )
 
 
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -250,10 +338,28 @@ class DrivoRModel(nn.Module):
         # scoring
         B,N,_,_=proposals.shape
 
-        embedded_traj = self.pos_embed(proposals.reshape(B, N, -1).detach())  # (B, N, d_model)
-        tr_out = self.scorer_attention(embedded_traj, scene_features)  # (B, N, d_model)
-        tr_out = tr_out+ego_token
-        pred_logit,pred_logit2, pred_agents_states, pred_area_logit ,bev_semantic_map,agent_states,agent_labels= self.scorer(proposals, tr_out)
+        scorer_scene_features = scene_features
+        scorer_ego_token = ego_token
+        if bool(self._config.get("lora_finetune", False)) and bool(
+            self._config.get("detach_scorer_inputs", True)
+        ):
+            # RFS supervision adapts only the scorer head, not shared proposal inputs.
+            scorer_scene_features = scorer_scene_features.detach()
+            scorer_ego_token = scorer_ego_token.detach()
+        detached_proposals = proposals.reshape(B, N, -1).detach()
+        rfs_feature = None
+        if bool(self._config.get("scorer_lora_enabled", False)):
+            with lora_activation(self.pos_embed, False), lora_activation(self.scorer_attention, False):
+                source_embedded_traj = self.pos_embed(detached_proposals)
+                tr_out = self.scorer_attention(source_embedded_traj, scorer_scene_features)
+            rfs_embedded_traj = self.pos_embed(detached_proposals)
+            rfs_feature = self.scorer_attention(rfs_embedded_traj, scorer_scene_features)
+            rfs_feature = rfs_feature + scorer_ego_token
+        else:
+            embedded_traj = self.pos_embed(detached_proposals)
+            tr_out = self.scorer_attention(embedded_traj, scorer_scene_features)
+        tr_out = tr_out + scorer_ego_token
+        pred_logit,pred_logit2, pred_agents_states, pred_area_logit ,bev_semantic_map,agent_states,agent_labels= self.scorer(proposals, tr_out, rfs_feature=rfs_feature)
 
         output["pred_logit"]=pred_logit
         output["pred_logit2"]=pred_logit2

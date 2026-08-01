@@ -121,6 +121,11 @@ class DrivoRAgent(AbstractAgent):
 
         if not cache_data:
             self._drivor_model = DrivoRModel(config)
+            if bool(config.get("lora_finetune", False)):
+                self._drivor_model.configure_lora_finetuning()
+                trainable = sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
+                total = sum(parameter.numel() for parameter in self.parameters())
+                print(f"LoRA finetuning parameters: {trainable:,} trainable / {total:,} total")
 
         if not cache_data and self._checkpoint_path == "": # only for training
             self.bce_logit_loss = nn.BCEWithLogitsLoss()
@@ -173,7 +178,30 @@ class DrivoRAgent(AbstractAgent):
             else:
                 state_dict: Dict[str, Any] = torch.load(self._checkpoint_path, map_location=torch.device("cpu"))[
                     "state_dict"]
-            self.load_state_dict({k.replace("agent._drivor_model", "_drivor_model"): v for k, v in state_dict.items()})
+            state_dict = {
+                key.replace("agent._drivor_model", "_drivor_model"): value
+                for key, value in state_dict.items()
+            }
+            incompatible = self.load_state_dict(state_dict, strict=False)
+            missing_base_keys = self._missing_pretrained_base_keys(incompatible.missing_keys)
+            if missing_base_keys or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    "Checkpoint is incompatible with DrivoR: "
+                    f"missing base keys={missing_base_keys}, "
+                    f"unexpected keys={incompatible.unexpected_keys}"
+                )
+
+    def _missing_pretrained_base_keys(self, missing_keys: List[str]) -> List[str]:
+        ignored_prefixes = ()
+        if self._config.get("domain_alignment", False):
+            ignored_prefixes = ("_drivor_model.domain_classifier.",)
+        return [
+            key
+            for key in missing_keys
+            if ".lora_A" not in key
+            and ".lora_B" not in key
+            and not key.startswith(ignored_prefixes)
+        ]
 
     def get_sensor_config(self) :
         """Inherited, see superclass."""
@@ -379,7 +407,7 @@ class DrivoRAgent(AbstractAgent):
             domain_loss = F.binary_cross_entropy_with_logits(pred["domain_logits"], pred["domain_labels"])
             domain_weight = float(self._config.get("domain_alignment_weight", 1.0))
             feature_alignment_loss = F.mse_loss(
-                pred["rendered_image_scene_tokens"].detach(), pred["real_image_scene_tokens"]
+                pred["rendered_image_scene_tokens"], pred["real_image_scene_tokens"].detach()
             )
             feature_alignment_weight = float(self._config.get("feature_alignment_weight", 0.0))
             domain_pred = pred["domain_logits"].detach() >= 0
@@ -397,12 +425,17 @@ class DrivoRAgent(AbstractAgent):
     def get_optimizers(self):
 
         global_batchsize = self.batch_size * self.num_gpus
+        trainable_parameters = [
+            parameter for parameter in self._drivor_model.parameters() if parameter.requires_grad
+        ]
+        if not trainable_parameters:
+            raise ValueError("DrivoR has no trainable parameters.")
         if self._lr_args["name"] == "Adam":
             lr = self._lr_args["base_lr"] * math.sqrt(global_batchsize / self._lr_args["base_batch_size"])
-            optimizer = torch.optim.Adam(self._drivor_model.parameters(), lr=lr)
+            optimizer = torch.optim.Adam(trainable_parameters, lr=lr)
         elif self._lr_args["name"] == "AdamW":
             lr = self._lr_args["base_lr"] * math.sqrt(global_batchsize / self._lr_args["base_batch_size"])
-            optimizer = torch.optim.AdamW(self._drivor_model.parameters(), lr=lr)
+            optimizer = torch.optim.AdamW(trainable_parameters, lr=lr)
         else:
             raise NotImplementedError
 

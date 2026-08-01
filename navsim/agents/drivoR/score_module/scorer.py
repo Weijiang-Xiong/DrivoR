@@ -2,6 +2,7 @@ import torch.nn as nn
 # from ..bevformer.transformer_decoder import MyTransformeDecoder,MLP
 # from ..bevformer.transformer_decoder import MLP
 from ..layers.utils.mlp import MLP
+from ..lora import inject_lora_into_mlp
 # from .map_head import MapHead
 
 
@@ -61,6 +62,17 @@ class Scorer(nn.Module):
             )
         })
 
+        scorer_lora_rank = int(config.get("scorer_lora_rank", 0))
+        if scorer_lora_rank > 0:
+            # Songdo provides one RFS target, so keep the five NAVSIM-only heads exact.
+            inject_lora_into_mlp(
+                self.pred_score["ego_progress"],
+                rank=scorer_lora_rank,
+                alpha=float(config.get("scorer_lora_alpha", 16.0)),
+                dropout=float(config.get("scorer_lora_dropout", 0.0)),
+                enabled=bool(config.get("scorer_lora_enabled", False)),
+            )
+
 
 
 
@@ -108,7 +120,7 @@ class Scorer(nn.Module):
         self.one_token_per_traj = config.one_token_per_traj
 
 
-    def forward(self, proposals,bev_feature):
+    def forward(self, proposals,bev_feature,rfs_feature=None):
         batch_size=len(proposals)
         p_size=proposals.shape[1]
         t_size=proposals.shape[2]
@@ -118,7 +130,8 @@ class Scorer(nn.Module):
         
         # selected_indices: B,
         for k, head in self.pred_score.items():
-            pred_logit[k] = head(proposal_feature).squeeze(-1)
+            head_feature = rfs_feature if k == "ego_progress" and rfs_feature is not None else proposal_feature
+            pred_logit[k] = head(head_feature).squeeze(-1)
         
         pred_logit2=pred_agents_states=pred_area_logit=bev_semantic_map=agent_states=agent_labels=None
 

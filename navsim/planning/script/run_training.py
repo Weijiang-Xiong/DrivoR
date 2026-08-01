@@ -36,11 +36,22 @@ def _load_finetune_checkpoint(lightning_module: AgentLightningModule, checkpoint
     """Warm-start a training module without restoring optimizer or trainer state."""
     checkpoint_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)["state_dict"]
     incompatible = lightning_module.load_state_dict(checkpoint_state, strict=False)
+    missing_base_keys = [
+        key
+        for key in incompatible.missing_keys
+        if ".lora_A" not in key
+        and ".lora_B" not in key
+        and ".domain_classifier." not in key
+    ]
+    if missing_base_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Checkpoint is incompatible with DrivoR LoRA finetuning: "
+            f"missing base keys={missing_base_keys}, "
+            f"unexpected keys={incompatible.unexpected_keys}"
+        )
     logger.info("Loaded fine-tuning checkpoint %s", checkpoint_path)
     if incompatible.missing_keys:
-        logger.info("Freshly initialized tensors: %s", ", ".join(incompatible.missing_keys))
-    if incompatible.unexpected_keys:
-        logger.warning("Unexpected checkpoint tensors: %s", ", ".join(incompatible.unexpected_keys))
+        logger.info("Initialized %d target-adaptation tensors", len(incompatible.missing_keys))
 
 
 class DrivoRDomainDataset(torch.utils.data.Dataset):
@@ -286,6 +297,21 @@ def main(cfg: DictConfig) -> None:
     finetune_ckpt_path = cfg.get("finetune_ckpt_path")
     if finetune_ckpt_path and cfg.train_ckpt_path:
         raise ValueError("finetune_ckpt_path and train_ckpt_path are mutually exclusive")
+    if bool(cfg.agent.config.get("lora_finetune", False)) and not (
+        finetune_ckpt_path or cfg.train_ckpt_path
+    ):
+        raise ValueError(
+            "DrivoR LoRA finetuning requires finetune_ckpt_path, or train_ckpt_path when resuming."
+        )
+    if (
+        bool(cfg.agent.config.get("lora_finetune", False))
+        and bool(cfg.agent.config.get("domain_alignment", False))
+        and bool(cfg.agent.config.get("backbone_lora_trainable", False))
+        and not cfg.get("navsim_cache_path")
+    ):
+        raise ValueError(
+            "Domain-aligned backbone LoRA finetuning requires navsim_cache_path with paired real/rendered images."
+        )
     if finetune_ckpt_path:
         _load_finetune_checkpoint(lightning_module, finetune_ckpt_path)
 

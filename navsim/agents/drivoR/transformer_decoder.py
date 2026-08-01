@@ -9,6 +9,7 @@ from .timm_layers import (
     DropPath,
     LayerScale,
 )
+from .lora import LoRALinear, LoRAMultiheadAttention
 
 
 class Attention(torch.nn.Module):
@@ -19,6 +20,9 @@ class Attention(torch.nn.Module):
             dim: int,
             num_heads: int = 8,
             proj_drop: float = 0.,
+            lora_rank: int = 0,
+            lora_alpha: float = 16.0,
+            lora_enabled: bool = False,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -27,6 +31,13 @@ class Attention(torch.nn.Module):
 
         self.attn = torch.nn.MultiheadAttention(dim, num_heads, 
                                                 dropout=0.0, bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None, vdim=None, batch_first=True, device=None, dtype=None)
+        if lora_rank > 0:
+            self.attn = LoRAMultiheadAttention.from_attention(
+                self.attn,
+                rank=lora_rank,
+                alpha=lora_alpha,
+                enabled=lora_enabled,
+            )
 
 
     def forward(self, q: torch.Tensor, 
@@ -52,7 +63,12 @@ class Block(torch.nn.Module):
             init_values: float = 0.0,
             act_layer: Type[torch.nn.Module] = torch.nn.GELU,
             norm_layer: Type[torch.nn.Module] = torch.nn.LayerNorm,
-            mlp_layer: Type[torch.nn.Module] = Mlp,):
+            mlp_layer: Type[torch.nn.Module] = Mlp,
+            lora_rank: int = 0,
+            lora_alpha: float = 16.0,
+            lora_enabled: bool = False,
+            lora_dropout: float = 0.0,
+            ):
         super().__init__()
 
         # self attention layer
@@ -61,6 +77,9 @@ class Block(torch.nn.Module):
             dim,
             num_heads=num_heads,
             proj_drop=proj_drop,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_enabled=lora_enabled,
         )
         self.self_attn_ls = LayerScale(dim, init_values=init_values) if (init_values > 0) else torch.nn.Identity()
         self.self_attn_drop_path = DropPath(drop_path) if drop_path > 0. else torch.nn.Identity()
@@ -72,6 +91,9 @@ class Block(torch.nn.Module):
             dim,
             num_heads=num_heads,
             proj_drop=proj_drop,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_enabled=lora_enabled,
         )
         self.cross_attn_ls = LayerScale(dim, init_values=init_values) if (init_values > 0) else torch.nn.Identity()
         self.cross_attn_drop_path = DropPath(drop_path) if drop_path > 0. else torch.nn.Identity()
@@ -85,6 +107,13 @@ class Block(torch.nn.Module):
             norm_layer=norm_layer if scale_mlp_norm else None,
             bias=proj_bias,
             drop=proj_drop,
+            )
+        if lora_rank > 0:
+            self.mlp.fc1 = LoRALinear.from_linear(
+                self.mlp.fc1, lora_rank, lora_alpha, lora_dropout, lora_enabled
+            )
+            self.mlp.fc2 = LoRALinear.from_linear(
+                self.mlp.fc2, lora_rank, lora_alpha, lora_dropout, lora_enabled
             )
         self.mlp_ls = LayerScale(dim, init_values=init_values) if init_values else torch.nn.Identity()
         self.mlp_drop_path = DropPath(drop_path) if drop_path > 0. else torch.nn.Identity()
@@ -120,6 +149,7 @@ class TransformerDecoder(torch.nn.Module):
 
         num_layers = config.ref_num
         d_model = config.tf_d_model
+        lora_rank = int(config.get("proposal_lora_rank", 0))
 
         _layers = []
         for i in range(num_layers):
@@ -129,7 +159,11 @@ class TransformerDecoder(torch.nn.Module):
                     num_heads=config.refiner_num_heads if hasattr(config, "refiner_num_heads") else 1,
                     init_values= config.refiner_ls_values if hasattr(config, "refiner_ls_values") else 0.0,
                     proj_drop=proj_drop,
-                    drop_path=drop_path
+                    drop_path=drop_path,
+                    lora_rank=lora_rank,
+                    lora_alpha=float(config.get("proposal_lora_alpha", 16.0)),
+                    lora_enabled=bool(config.get("proposal_lora_enabled", False)),
+                    lora_dropout=float(config.get("proposal_lora_dropout", 0.0)),
                 )
             )
         self.layers = torch.nn.ModuleList(_layers)
@@ -156,6 +190,7 @@ class TransformerDecoderScorer(torch.nn.Module):
         super().__init__()
 
         _layers = []
+        lora_rank = int(config.get("scorer_lora_rank", 0))
         for i in range(num_layers):
             _layers.append(
                 Block(
@@ -163,7 +198,11 @@ class TransformerDecoderScorer(torch.nn.Module):
                     num_heads=config.refiner_num_heads if hasattr(config, "refiner_num_heads") else 1,
                     init_values= config.refiner_ls_values if hasattr(config, "refiner_ls_values") else 0.0,
                     proj_drop=proj_drop,
-                    drop_path=drop_path
+                    drop_path=drop_path,
+                    lora_rank=lora_rank,
+                    lora_alpha=float(config.get("scorer_lora_alpha", 16.0)),
+                    lora_enabled=bool(config.get("scorer_lora_enabled", False)),
+                    lora_dropout=float(config.get("scorer_lora_dropout", 0.0)),
                 )
             )
         self.layers = torch.nn.ModuleList(_layers)
@@ -182,6 +221,3 @@ class TransformerDecoderScorer(torch.nn.Module):
             return torch.stack(intermediate)
         else:
             return x
-
-
-
