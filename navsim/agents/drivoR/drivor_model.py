@@ -1,4 +1,5 @@
 from typing import Dict
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,6 +12,14 @@ from navsim.agents.drivoR.utils import pylogger
 log = pylogger.get_pylogger(__name__)
 import logging
 # log.setLevel(logging.DEBUG)
+
+
+class LambdaScheduler:
+    def __init__(self, gamma=10.0):
+        self.gamma = gamma
+
+    def __call__(self, progress: float) -> float:
+        return 2.0 / (1.0 + math.exp(-self.gamma * progress)) - 1.0
 
 
 class _GradReverse(torch.autograd.Function):
@@ -141,6 +150,8 @@ class DrivoRModel(nn.Module):
         if self.domain_alignment:
             hidden = int(config.get("domain_classifier_hidden", 512))
             self.domain_classifier = DomainClassifier(config.tf_d_model, hidden=hidden)
+            self.lambda_scheduler = LambdaScheduler(gamma=10.0)
+            self.domain_alignment_progress = 0.0
 
         self.b2d=config.b2d
 
@@ -201,7 +212,7 @@ class DrivoRModel(nn.Module):
                     )
                     output["domain_logits"] = self.domain_classifier(
                         domain_features,
-                        lambd=float(self._config.get("domain_grl_lambda", 1.0)),
+                        lambd=self.lambda_scheduler(self.domain_alignment_progress),
                     )
                     output["domain_labels"] = domain_labels
 

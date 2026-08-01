@@ -10,7 +10,7 @@ import pickle
 from .drivor_model import DrivoRModel
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.planning.training.dataset import load_feature_target_from_pickle
-from pytorch_lightning.callbacks import ModelCheckpoint, ProgressBar, LearningRateMonitor
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint, ProgressBar, LearningRateMonitor
 from navsim.common.dataloader import MetricCacheLoader
 from navsim.common.dataclasses import SensorConfig
 from .drivor_features import DrivoRTargetBuilder
@@ -18,6 +18,14 @@ from .drivor_features import DrivoRFeatureBuilder
 import sys
 from omegaconf import OmegaConf
 import math
+
+from navsim.common.waymo_utils import get_rater_feedback_score, interpolate_trajectory
+
+
+class DomainAlignmentProgressCallback(Callback):
+    def on_train_epoch_start(self, trainer, pl_module) -> None:
+        progress = min((trainer.current_epoch + 1) / trainer.max_epochs, 1.0)
+        pl_module.agent._drivor_model.domain_alignment_progress = progress
 
 
 def _slice_batch(data, mask: torch.Tensor):
@@ -105,6 +113,7 @@ class DrivoRAgent(AbstractAgent):
         self.batch_size = batch_size
         self.num_gpus = num_gpus
         self.use_metric_cache = bool(config.use_metric_cache)
+        self.scorer_type =  "pdm" if self.use_metric_cache else config.get("scorer", "imitation")
         self.loss = loss
 
 
@@ -245,16 +254,102 @@ class DrivoRAgent(AbstractAgent):
 
             return final_scores, best_scores, target_scores, key_agent_corners, key_agent_labels, all_ego_areas
 
+    def compute_score_rfs(self, targets, proposals):
+        if proposals.shape[-2] % 2 != 0:
+            raise ValueError("RFS expects 2Hz proposal waypoints so they can be interpolated to 4Hz.")
+
+        rfs_length_seconds = proposals.shape[-2] // 2
+        initial_speed = targets["initial_speed"].detach().cpu().numpy()
+        prediction_trajectories = proposals.detach().cpu().numpy()[..., :2]
+        rater_specified_trajectories = []
+        rater_scores = []
+        interpolated_predictions = []
+
+        if targets.get("rfs_trajs") is None:
+            target_trajectories = targets["trajectory"].detach().cpu().numpy()
+            for target_trajectory, sample_predictions in zip(
+                target_trajectories, prediction_trajectories
+            ):
+                rater_specified_trajectories.append(
+                    [interpolate_trajectory(target_trajectory)]
+                )
+                rater_scores.append(np.array([10]))
+                interpolated_predictions.append(
+                    np.stack(
+                        [
+                            interpolate_trajectory(prediction)
+                            for prediction in sample_predictions
+                        ]
+                    )
+                )
+            default_num_rater_trajectories = 1
+        else:
+            rfs_trajectories = targets["rfs_trajs"].detach().cpu().numpy()
+            rfs_lengths = targets["rfs_len"].detach().cpu().numpy()
+            rfs_score_values = targets["rfs_scores"].detach().cpu().numpy()
+            for sample_rfs, sample_lengths, sample_scores, sample_predictions in zip(
+                rfs_trajectories,
+                rfs_lengths,
+                rfs_score_values,
+                prediction_trajectories,
+            ):
+                rater_specified_trajectories.append(
+                    [
+                        trajectory[:length]
+                        for trajectory, length in zip(sample_rfs, sample_lengths)
+                    ]
+                )
+                rater_scores.append(sample_scores)
+                interpolated_predictions.append(
+                    np.stack(
+                        [
+                            interpolate_trajectory(prediction)
+                            for prediction in sample_predictions
+                        ]
+                    )
+                )
+            default_num_rater_trajectories = 3
+
+        prediction_probabilities = np.ones(
+            (len(interpolated_predictions), proposals.shape[1])
+        )
+        rfs_metrics = get_rater_feedback_score(
+            np.stack(interpolated_predictions),
+            prediction_probabilities,
+            rater_specified_trajectories,
+            rater_scores,
+            initial_speed,
+            frequency=4,
+            length_seconds=rfs_length_seconds,
+            default_num_of_rater_specified_trajectories=default_num_rater_trajectories,
+            output_trust_region_visualization=False,
+        )
+        scores = np.maximum(
+            (rfs_metrics["rater_feedback_score_per_inference"] - 4) / 6,
+            0,
+        )
+        scores = torch.from_numpy(scores).to(proposals.device)
+        return scores, scores.amax(dim=-1)
+
     def compute_loss(
             self,
             features: Dict[str, torch.Tensor],
             targets: Dict[str, torch.Tensor],
             pred: Dict[str, torch.Tensor],
     ) -> Dict:
-        scoring_function = self.compute_score if self.use_metric_cache else None
+        scoring_function = {
+            "pdm": self.compute_score,
+            "rfs": self.compute_score_rfs,
+            "imitation": None,
+        }[self.scorer_type]
+        if self.scorer_type == "rfs":
+            targets = dict(targets)
+            targets["initial_speed"] = torch.linalg.vector_norm(
+                features["ego_status"][:, -1, 3:5], dim=-1
+            )
         domain_mask = features.get("domain_alignment_mask")
         if domain_mask is None:
-            return self.loss(targets, pred, self._config, scoring_function)
+            return self.loss(targets, pred, self._config, scoring_function, self.scorer_type)
 
         domain_mask = domain_mask.bool().flatten()
         trajectory_mask = ~domain_mask
@@ -264,7 +359,13 @@ class DrivoRAgent(AbstractAgent):
         if torch.any(trajectory_mask):
             trajectory_targets = _slice_batch(targets, trajectory_mask)
             trajectory_pred = _slice_batch(pred, trajectory_mask)
-            trajectory_loss = self.loss(trajectory_targets, trajectory_pred, self._config, scoring_function)
+            trajectory_loss = self.loss(
+                trajectory_targets,
+                trajectory_pred,
+                self._config,
+                scoring_function,
+                self.scorer_type,
+            )
             if isinstance(trajectory_loss, dict):
                 loss_dict.update(trajectory_loss)
                 total_loss = total_loss + trajectory_loss["loss"]
@@ -337,7 +438,7 @@ class DrivoRAgent(AbstractAgent):
             return [optimizer]
 
     def get_training_callbacks(self):
-        if self.use_metric_cache:
+        if self.scorer_type in {"pdm", "rfs"}:
             checkpoint_cb_best = ModelCheckpoint(save_top_k=1,
                                             monitor='val/score',
                                             filename='best-{epoch}-{step}',
@@ -356,8 +457,9 @@ class DrivoRAgent(AbstractAgent):
                                             log_momentum=False,
                                             log_weight_decay=False)
         
-        if self.progress_bar:
-            return [checkpoint_cb_best, checkpoint_cb, lr_monitor]
-        else:
-            progress_bar = LitProgressBar()
-            return [checkpoint_cb_best, checkpoint_cb, progress_bar, lr_monitor]
+        callbacks = [checkpoint_cb_best, checkpoint_cb, lr_monitor]
+        if self._config.domain_alignment:
+            callbacks.append(DomainAlignmentProgressCallback())
+        if not self.progress_bar:
+            callbacks.insert(2, LitProgressBar())
+        return callbacks

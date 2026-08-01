@@ -111,6 +111,33 @@ class AgentLightningModule(pl.LightningModule):
                 self.log(f"{logging_prefix}/comfort", comfort, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
                 return final_score
+            elif self.agent.scorer == "rfs":
+                proposals = predictions["proposals"]
+                rfs_targets = dict(targets)
+                rfs_targets["initial_speed"] = torch.linalg.vector_norm(
+                    features["ego_status"][:, -1, 3:5], dim=-1
+                )
+                proposal_scores, best_scores = self.agent.compute_score_rfs(
+                    rfs_targets, proposals
+                )
+                pred_score_index = torch.argmax(predictions["pdm_score"], dim=1)
+                best_score_index = torch.argmax(proposal_scores, dim=1)
+                batch_indices = torch.arange(len(proposal_scores), device=proposal_scores.device)
+                score = proposal_scores[batch_indices, pred_score_index].mean()
+                score_hit_rate = torch.mean(
+                    pred_score_index == best_score_index, dtype=torch.float32
+                )
+                chosen_fde = torch.linalg.vector_norm(
+                    predictions["trajectory"][:, -1, :2]
+                    - targets["trajectory"][:, -1, :2],
+                    dim=-1,
+                ).mean()
+
+                self.log(f"{logging_prefix}/score", score, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+                self.log(f"{logging_prefix}/best_score", best_scores.mean(), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+                self.log(f"{logging_prefix}/rfs_score_hit_rate", score_hit_rate, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+                self.log(f"{logging_prefix}/chosen_fde", chosen_fde, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+                return score
             else:
                 proposals = predictions["proposals"]
                 target_trajectory = targets["trajectory"]

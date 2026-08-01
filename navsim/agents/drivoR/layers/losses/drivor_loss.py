@@ -273,7 +273,14 @@ class DrivoRLoss(torch.nn.Module):
         hit_rate = (score_logits.detach().argmax(1) == best_idx).float().mean()
         return loss, hit_rate, target_entropy
 
-    def forward(self,targets: Dict[str, torch.Tensor], pred: Dict[str, torch.Tensor], config  , scoring_function=None):
+    def forward(
+            self,
+            targets: Dict[str, torch.Tensor],
+            pred: Dict[str, torch.Tensor],
+            config,
+            scoring_function=None,
+            scorer: str = "imitation",
+    ):
 
         proposals = pred["proposals"]
         proposal_list = pred["proposal_list"]
@@ -320,8 +327,13 @@ class DrivoRLoss(torch.nn.Module):
         # min_loss1 = min_loss_list[1]
         # inter_loss1 = inter_loss_list[1]
 
-        # use PDM score when metric cache is enabled, otherwise use imitation score loss
-        if scoring_function is not None:
+        rfs_score_loss = proposals.new_zeros(())
+        rfs_score_hit_rate = proposals.new_zeros(())
+        imitation_score_loss = proposals.new_zeros(())
+        imitation_score_hit_rate = proposals.new_zeros(())
+        imitation_score_target_entropy = proposals.new_zeros(())
+
+        if scorer == "pdm":
             final_scores, best_scores, target_scores, gt_states, gt_valid, gt_ego_areas = scoring_function(
                 targets, proposals, test=False)
             l2_distance =  -((proposals.detach() - target_trajectory[:, None]) ** 2) / 0.5
@@ -338,9 +350,24 @@ class DrivoRLoss(torch.nn.Module):
             score = final_scores[np.arange(len(final_scores)), top_proposals].mean()
             best_score = best_scores.mean()
             [da_loss, ttc_loss, noc_loss, progress_loss, ddc_loss, comfort_loss] = sub_score_loss
-            imitation_score_loss = proposals.new_tensor(0.0)
-            imitation_score_hit_rate = proposals.new_tensor(0.0)
-            imitation_score_target_entropy = proposals.new_tensor(0.0)
+        elif scorer == "rfs":
+            final_scores, best_scores = scoring_function(targets, proposals)
+            score_logits = pred["pred_logit"]["ego_progress"]
+            final_scores = final_scores.to(dtype=score_logits.dtype)
+            rfs_score_loss = F.binary_cross_entropy_with_logits(
+                score_logits, final_scores
+            )
+            final_score_loss = rfs_score_loss
+            pred_ce_loss = pred_l1_loss = pred_area_loss = 0
+            da_loss = ttc_loss = noc_loss = progress_loss = ddc_loss = comfort_loss = 0
+
+            top_proposals = torch.argmax(pred["pdm_score"].detach(), dim=1)
+            batch_indices = torch.arange(len(final_scores), device=final_scores.device)
+            score = final_scores[batch_indices, top_proposals].mean()
+            best_score = best_scores.mean()
+            rfs_score_hit_rate = (
+                score_logits.detach().argmax(dim=1) == final_scores.argmax(dim=1)
+            ).float().mean()
         else:
             imitation_score_loss, imitation_score_hit_rate, imitation_score_target_entropy = self.imitation_score_loss(
                 pred["pred_logit"]["ego_progress"], proposals, target_trajectory
@@ -394,6 +421,8 @@ class DrivoRLoss(torch.nn.Module):
             "imitation_score_loss": imitation_score_loss,
             "imitation_score_hit_rate": imitation_score_hit_rate,
             "imitation_score_target_entropy": imitation_score_target_entropy,
+            "rfs_score_loss": rfs_score_loss,
+            "rfs_score_hit_rate": rfs_score_hit_rate,
             "inter_loss0": inter_loss0,
             # "inter_loss1": inter_loss1,
             "inter_loss": inter_loss,
