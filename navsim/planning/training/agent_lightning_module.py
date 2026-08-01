@@ -111,7 +111,7 @@ class AgentLightningModule(pl.LightningModule):
                 self.log(f"{logging_prefix}/comfort", comfort, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
                 return final_score
-            elif self.agent.scorer == "rfs":
+            elif self.agent.scorer_type == "rfs":
                 proposals = predictions["proposals"]
                 rfs_targets = dict(targets)
                 rfs_targets["initial_speed"] = torch.linalg.vector_norm(
